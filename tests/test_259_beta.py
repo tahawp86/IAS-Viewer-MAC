@@ -3,7 +3,7 @@
 
 سناریو:
  ۱) ورود اجباری با نام‌کاربری/رمز؛ رمزها با PBKDF2 ذخیره می‌شوند (نه متن‌ساده).
- ۲) ادمین پیش‌فرض کارخانه (admin/Aa@@Sorena) در اولین ورود مجبور به تعویض رمز است.
+ ۲) ادمین پیش‌فرض کارخانه (admin) در اولین ورود مجبور به تعویض رمز است.
  ۳) سطح دسترسی صفحه‌ها برای کاربر عادی اعمال می‌شود؛ لایسنس همیشه ادمین.
  ۴) بررسی خودکار آپدیت از GitHub Releases (بدون شبکه‌ی واقعی — mock).
  ۵) رگرسیون امنیتی استاتیک: بدون shell=True، بدون eval/pickle روی داده‌ی
@@ -39,7 +39,7 @@ def test_default_admin_created_with_forced_change():
     um, mgr = _fresh_mgr()
     assert mgr.ensure_default_admin() is True
     assert mgr.ensure_default_admin() is False  # دوباره‌خوانی نسازد
-    u = mgr.verify("admin", "Aa@@Sorena")
+    u = mgr.verify("admin", "A12345678a")
     assert u is not None, "ادمین پیش‌فرض باید لاگین کند"
     assert u.get("must_change_password") is True, \
         "رمز کارخانه باید در اولین ورود عوض شود"
@@ -54,7 +54,7 @@ def test_passwords_hashed_not_plaintext():
     assert mgr.create_user("op1", "secret12", permissions={"home": True})
     assert mgr.set_password("admin", "NewPass123")
     raw = open(mgr.path, encoding="utf-8").read()
-    for secret in ("Aa@@Sorena", "secret12", "NewPass123"):
+    for secret in ("A12345678a", "secret12", "NewPass123"):
         assert secret not in raw, f"رمز متن‌ساده روی دیسک است: {secret}"
     # هش‌ها یکتا و قابل راستی‌آزمایی‌اند
     assert mgr.verify("op1", "secret12") is not None
@@ -76,7 +76,7 @@ def test_permission_model():
     assert um.UserManager.can_access(op, "settings") is False
     assert um.UserManager.allowed_pages(op) == ["home", "fire"]
     assert um.UserManager.is_admin(op) is False
-    admin = mgr.verify("admin", "Aa@@Sorena")
+    admin = mgr.verify("admin", "A12345678a")
     assert um.UserManager.can_access(admin, "plate") is True  # ادمین = همه‌چیز
 
 
@@ -309,7 +309,7 @@ def test_main_window_applies_permissions():
     assert not w.header_update_btn.isVisible()
     w.show_page("plate")  # محافظ: نباید عوض شود
     assert w._current_page_key == "home"
-    admin = mgr.verify("admin", "Aa@@Sorena")
+    admin = mgr.verify("admin", "A12345678a")
     w2 = app_main.MainWindow(current_user=admin)
     w2.resize(1600, 900)
     w2.show()
