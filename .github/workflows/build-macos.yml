@@ -36,6 +36,10 @@ env:
 jobs:
   build-macos:
     runs-on: macos-latest
+    # (1.0.0) انتشار ریلیز با gh release به contents:write نیاز دارد —
+    # پیش‌فرض read-only ریپو باعث fail خاموش استپ Publish می‌شد.
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -431,7 +435,7 @@ jobs:
             # اگر ریلیز هم‌زمان توسط بیلد دیگری ساخته شد، فقط آپلود می‌کنیم.
             _pre=""
             case "$ver" in *beta*) _pre="--prerelease";; esac
-            if ! gh release create "$tag" "${files[@]}" --title "IAS Viewer $ver (macOS)" --notes "$notes" $_pre 2>/dev/null; then
+            if ! gh release create "$tag" "${files[@]}" --title "IAS Viewer $ver (macOS)" --notes "$notes" $_pre; then
               sleep 5
               gh release upload "$tag" "${zip[0]}" --clobber
               if [ -f "${dmg[0]}" ]; then gh release upload "$tag" "${dmg[0]}" --clobber; fi
