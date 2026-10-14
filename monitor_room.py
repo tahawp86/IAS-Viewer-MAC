@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""monitor_room.py — اتاق مانیتورینگ (multi-monitor) نسخه‌ی مک (1.1.0).
+"""monitor_room.py — اتاق مانیتورینگ (multi-monitor) نسخه‌ی مک (1.1.1).
 
 قابلیت «اتاق مانیتورینگ»: تقسیم تصاویر دوربین‌ها روی چند مانیتور متصل به سیستم.
-- شناسایی مانیتورها با QApplication.screens()
-- دیالوگ تنظیمات: برای هر مانیتور انتخاب دوربین‌ها + حالت تمام‌صفحه
-- یک پنجره‌ی نمایش جداگانه برای هر مانیتور، روی همان صفحه (تمام‌صفحه یا پنجره‌ای)
-- ذخیره‌ی چیدمان در monitor_layout.json (پوشه‌ی دیتای برنامه)؛ بعد از بستن و باز
-  کردن برنامه، چیدمان در دیالوگ بازیابی می‌شود.
+- شناسایی مانیتورها با QApplication.screens() (نمایشی، برای راهنمایی کاربر)
+- دیالوگ تنظیمات: افزودن/حذف «پنجره»، انتخاب دوربین‌های هر پنجره
+- هر پنجره یک پنجره‌ی مستقل، کاملاً movable و resizable است — کاربر با موس
+  می‌گیرد و روی هر مانیتوری که می‌خواهد می‌اندازد؛ F11 یا دابل‌کلیک: تمام‌صفحه
+- ذخیره‌ی چیدمان در monitor_layout.json (دوربین‌ها + موقعیت/اندازه + تمام‌صفحه‌ی
+  هر پنجره)؛ بعد از بستن و باز کردن برنامه، چیدمان بازیابی می‌شود.
+  (چیدمان قدیمی نسخه‌ی 1.1.0 به‌صورت خودکار مهاجرت می‌کند.)
 
 نکته‌ی طراحی: تایل‌های این پنجره‌ها فقط «نمایش» می‌دهند — هر تایل استریم
 مستقیم خودش را باز می‌کند (CameraStreamThread) ولی هیچ callback رویدادی
@@ -19,10 +21,10 @@ import os
 import time
 
 import cv2
-from PyQt6.QtCore import Qt, QPoint
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import Qt, QEvent, QPoint
+from PyQt6.QtGui import QImage, QPixmap, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QGridLayout, QGroupBox, QHBoxLayout,
+    QApplication, QDialog, QGridLayout, QGroupBox, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
@@ -60,8 +62,25 @@ def list_screens():
     return out
 
 
+def _migrate_layout(saved):
+    """مهاجرت چیدمان قدیمی (1.1.0، کلید screens) به فرمت پنجره‌محور (1.1.1)."""
+    if not isinstance(saved, dict):
+        return []
+    if isinstance(saved.get("windows"), list):
+        return [w for w in saved["windows"] if isinstance(w, dict)]
+    wins = []
+    for s in saved.get("screens", []) or []:
+        if not isinstance(s, dict):
+            continue
+        cams = [c for c in (s.get("cameras") or []) if c]
+        if cams:
+            wins.append({"cameras": cams, "geometry": None,
+                         "fullscreen": bool(s.get("fullscreen", False))})
+    return wins
+
+
 class MonitorLayoutStore:
-    """خواندن/نوشتن چیدمان مانیتورها در monitor_layout.json."""
+    """خواندن/نوشتن چیدمان اتاق مانیتورینگ در monitor_layout.json."""
 
     def __init__(self, path=None):
         self.path = path or os.path.join(get_data_dir(), LAYOUT_FILENAME)
@@ -70,12 +89,10 @@ class MonitorLayoutStore:
         try:
             with open(self.path, encoding="utf-8") as fh:
                 data = json.load(fh)
-            screens = data.get("screens", [])
-            if isinstance(screens, list):
-                return {"screens": [s for s in screens if isinstance(s, dict)]}
+            return {"version": 2, "windows": _migrate_layout(data)}
         except Exception:
             pass
-        return {"screens": []}
+        return {"version": 2, "windows": []}
 
     def save(self, layout):
         try:
@@ -180,14 +197,18 @@ class MonitorTileWidget(QWidget):
 
 
 class MonitorWindow(QMainWindow):
-    """پنجره‌ی نمایش یک مانیتور در اتاق مانیتورینگ."""
+    """پنجره‌ی نمایش مستقل اتاق مانیتورینگ — کاملاً movable و resizable.
 
-    def __init__(self, screen_name, cam_ids, cameras_by_id, build_rtsp_url,
-                 face_engine, parent=None):
+    کاربر با موس می‌گیرد و روی هر مانیتوری می‌اندازد؛ F11 یا دابل‌کلیک:
+    تمام‌صفحه.
+    """
+
+    def __init__(self, title, cam_ids, cameras_by_id, build_rtsp_url,
+                 face_engine, on_closed=None, parent=None):
         super().__init__(parent)
-        self.screen_name = screen_name
         self.tiles = []
-        self.setWindowTitle(f"🖥 اتاق مانیتورینگ — {screen_name}")
+        self._on_closed = on_closed
+        self.setWindowTitle(title)
         central = QWidget()
         self.setCentralWidget(central)
         grid = QGridLayout(central)
@@ -207,31 +228,57 @@ class MonitorWindow(QMainWindow):
             self.tiles.append(tile)
             grid.addWidget(tile, i // cols, i % cols)
         if not self.tiles:
-            lbl = QLabel("دوربینی برای این مانیتور انتخاب نشده است.")
+            lbl = QLabel("دوربینی برای این پنجره انتخاب نشده است.")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             grid.addWidget(lbl, 0, 0)
+        # F11: تمام‌صفحه؛ دابل‌کلیک روی هرجای پنجره هم همین کار را می‌کند.
+        self._fs_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
+        self._fs_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._fs_shortcut.activated.connect(self.toggle_fullscreen)
+        self.installEventFilter(self)
 
-    def show_on_screen(self, screen, fullscreen=False):
-        """نمایش پنجره روی مانیتور مشخص (تمام‌صفحه یا پنجره‌ای)."""
-        # اول پنجره‌ی نیتیو ساخته می‌شود تا setScreen اثر کند.
-        self.winId()
-        handle = self.windowHandle()
-        if handle is not None:
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.MouseButtonDblClick:
+            self.toggle_fullscreen()
+            return True
+        return super().eventFilter(obj, event)
+
+    def toggle_fullscreen(self):
+        try:
+            if self.isFullScreen():
+                self.showNormal()
+            else:
+                self.showFullScreen()
+        except Exception:
+            pass
+
+    def show_initial(self, geometry=None, fullscreen=False):
+        """نمایش اولیه: با موقعیت/اندازه‌ی ذخیره‌شده، یا اندازه‌ی پیش‌فرض."""
+        if geometry and len(geometry) == 4:
             try:
-                handle.setScreen(screen)
+                x, y, w, h = [int(v) for v in geometry]
+                self.setGeometry(x, y, max(320, w), max(240, h))
             except Exception:
                 pass
         if fullscreen:
+            # نیتیو باید ساخته شده باشد تا تمام‌صفحه درست اعمال شود.
+            self.winId()
             self.showFullScreen()
         else:
-            try:
-                geo = screen.geometry()
-                self.move(geo.topLeft() + QPoint(40, 40))
-                self.resize(min(1280, max(640, geo.width() - 80)),
-                            min(800, max(480, geo.height() - 80)))
-            except Exception:
-                pass
             self.show()
+
+    def window_state(self):
+        """وضعیت قابل ذخیره‌سازی پنجره: موقعیت/اندازه + تمام‌صفحه."""
+        try:
+            if self.isFullScreen():
+                ng = self.normalGeometry()
+                geo = [ng.x(), ng.y(), ng.width(), ng.height()]
+            else:
+                g = self.geometry()
+                geo = [g.x(), g.y(), g.width(), g.height()]
+        except Exception:
+            geo = None
+        return {"geometry": geo, "fullscreen": bool(self.isFullScreen())}
 
     def closeEvent(self, event):
         for tile in self.tiles:
@@ -239,110 +286,162 @@ class MonitorWindow(QMainWindow):
                 tile.stop()
             except Exception:
                 pass
+        try:
+            if self._on_closed is not None:
+                self._on_closed(self)
+        except Exception:
+            pass
         super().closeEvent(event)
 
 
 class MonitorRoomDialog(QDialog):
-    """دیالوگ تنظیم اتاق مانیتورینگ: انتخاب دوربین‌های هر مانیتور + تمام‌صفحه."""
+    """دیالوگ تنظیم اتاق مانیتورینگ: مدیریت پنجره‌ها و دوربین‌های هر پنجره."""
 
-    def __init__(self, cameras, saved_layout, on_open, on_close_all, parent=None):
+    def __init__(self, cameras, saved_windows, parent=None):
         super().__init__(parent)
         self.setWindowTitle("🖥 اتاق مانیتورینگ")
         self.setMinimumSize(560, 480)
-        self._on_open = on_open
-        self._on_close_all = on_close_all
-        self._save_callback = None
-        self._screen_rows = []  # (screen_name, QScreen, fullscreen_cb, QListWidget)
-
-        saved_by_screen = {}
-        for s in (saved_layout or {}).get("screens", []):
-            if isinstance(s, dict) and s.get("screen"):
-                saved_by_screen[s.get("screen")] = s
+        self._cameras = cameras
+        self._rows = []  # dict: {box, list}
+        # callbackها را مدیر ست می‌کند
+        self.on_open_window = None    # (cam_ids) -> None
+        self.on_open_all = None       # (configs) -> None
+        self.on_close_all = None      # () -> None
+        self._save_callback = None    # () -> bool
 
         lay = QVBoxLayout(self)
-        info = QLabel("برای هر مانیتور، دوربین‌هایی که باید نمایش داده شوند را تیک بزنید. "
-                      "چیدمان با «ذخیره‌ی چیدمان» نگه داشته می‌شود و بعد از بستن و باز کردن "
-                      "برنامه در همین دیالوگ بازیابی می‌شود.")
+        n_screens = len(list_screens())
+        info = QLabel(
+            f"{n_screens} مانیتور شناسایی شد. برای هر پنجره دوربین‌ها را تیک بزنید؛ "
+            "پنجره‌ها کاملاً قابل جابه‌جایی و تغییر اندازه‌اند — با موس بگیرید و روی "
+            "هر مانیتوری که می‌خواهید بیندازید. تمام‌صفحه: F11 یا دابل‌کلیک روی پنجره.")
         info.setWordWrap(True)
         lay.addWidget(info)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        content = QWidget()
-        content_lay = QVBoxLayout(content)
-        screens = list_screens()
-        if not screens:
-            content_lay.addWidget(QLabel("مانیتوری شناسایی نشد."))
-        for idx, (name, geo, scr) in enumerate(screens):
-            box = QGroupBox(f"مانیتور {idx + 1} — {name} ({geo.width()}×{geo.height()})")
-            box_lay = QVBoxLayout(box)
-            saved = saved_by_screen.get(name, {})
-            fs_cb = QCheckBox("تمام‌صفحه")
-            fs_cb.setChecked(bool(saved.get("fullscreen", True)))
-            box_lay.addWidget(fs_cb)
-            box_lay.addWidget(QLabel("دوربین‌ها:"))
-            lst = QListWidget()
-            lst.setSelectionMode(QListWidget.SelectionMode.NoSelection)
-            saved_cams = set(saved.get("cameras", []) or [])
-            for cam in cameras:
-                cid = cam.get("id")
-                label = cam.get("name") or cam.get("ip", "")
-                item = QListWidgetItem(str(label))
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Checked
-                                   if cid in saved_cams else Qt.CheckState.Unchecked)
-                item.setData(Qt.ItemDataRole.UserRole, cid)
-                lst.addItem(item)
-            lst.setMaximumHeight(min(220, max(90, 28 * max(1, len(cameras)))))
-            box_lay.addWidget(lst)
-            content_lay.addWidget(box)
-            self._screen_rows.append((name, scr, fs_cb, lst))
-        content_lay.addStretch()
-        scroll.setWidget(content)
+        self._content = QWidget()
+        self._content_lay = QVBoxLayout(self._content)
+        self._content_lay.addStretch()
+        scroll.setWidget(self._content)
         lay.addWidget(scroll, 1)
+
+        add_row = QHBoxLayout()
+        self.add_btn = QPushButton("➕ افزودن پنجره‌ی جدید")
+        self.add_btn.clicked.connect(lambda: self.add_window_row())
+        add_row.addWidget(self.add_btn)
+        add_row.addStretch()
+        lay.addLayout(add_row)
 
         btn_row = QHBoxLayout()
         self.save_btn = QPushButton("💾 ذخیره‌ی چیدمان")
         self.save_btn.clicked.connect(self._on_save_clicked)
-        self.open_btn = QPushButton("🖥 باز کردن مانیتورها")
-        self.open_btn.clicked.connect(self._on_open_clicked)
+        self.open_all_btn = QPushButton("🖥 باز کردن همه")
+        self.open_all_btn.clicked.connect(self._on_open_all_clicked)
         self.close_all_btn = QPushButton("✖ بستن همه")
         self.close_all_btn.clicked.connect(self._on_close_all_clicked)
         btn_row.addWidget(self.save_btn)
-        btn_row.addWidget(self.open_btn)
+        btn_row.addWidget(self.open_all_btn)
         btn_row.addWidget(self.close_all_btn)
         btn_row.addStretch()
         lay.addLayout(btn_row)
 
+        if saved_windows:
+            for w in saved_windows:
+                self.add_window_row((w or {}).get("cameras") or [])
+        else:
+            self.add_window_row()
+
     def set_save_callback(self, cb):
         self._save_callback = cb
 
-    def current_layout(self):
-        screens = []
-        for name, _scr, fs_cb, lst in self._screen_rows:
-            cams = []
-            for i in range(lst.count()):
-                item = lst.item(i)
-                if item.checkState() == Qt.CheckState.Checked:
-                    cams.append(item.data(Qt.ItemDataRole.UserRole))
-            screens.append({"screen": name, "cameras": cams,
-                            "fullscreen": bool(fs_cb.isChecked())})
-        return {"version": 1, "screens": screens}
+    def add_window_row(self, checked_ids=None):
+        checked = set(checked_ids or [])
+        idx = len(self._rows) + 1
+        box = QGroupBox(f"پنجره‌ی {idx}")
+        box_lay = QVBoxLayout(box)
+        lst = QListWidget()
+        lst.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        for cam in self._cameras:
+            cid = cam.get("id")
+            label = cam.get("name") or cam.get("ip", "")
+            item = QListWidgetItem(str(label))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked
+                               if cid in checked else Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, cid)
+            lst.addItem(item)
+        lst.setMaximumHeight(min(200, max(80, 28 * max(1, len(self._cameras)))))
+        box_lay.addWidget(QLabel("دوربین‌های این پنجره:"))
+        box_lay.addWidget(lst)
+        row_btns = QHBoxLayout()
+        open_btn = QPushButton("🖥 باز کردن این پنجره")
+        remove_btn = QPushButton("🗑 حذف")
+        row_btns.addWidget(open_btn)
+        row_btns.addWidget(remove_btn)
+        row_btns.addStretch()
+        box_lay.addLayout(row_btns)
+        # درج قبل از addStretch انتهایی
+        self._content_lay.insertWidget(self._content_lay.count() - 1, box)
+        row = {"box": box, "list": lst}
+        self._rows.append(row)
+        open_btn.clicked.connect(lambda: self._open_row(row))
+        remove_btn.clicked.connect(lambda: self._remove_row(row))
+        self._renumber()
+        return row
+
+    def _renumber(self):
+        for i, row in enumerate(self._rows, 1):
+            row["box"].setTitle(f"پنجره‌ی {i}")
+
+    def _remove_row(self, row):
+        if row in self._rows:
+            self._rows.remove(row)
+            row["box"].setParent(None)
+            row["box"].deleteLater()
+            self._renumber()
+
+    def _row_cameras(self, row):
+        cams = []
+        lst = row["list"]
+        for i in range(lst.count()):
+            item = lst.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                cams.append(item.data(Qt.ItemDataRole.UserRole))
+        return cams
+
+    def window_configs(self):
+        """پیکربندی پنجره‌ها: فقط ردیف‌هایی که حداقل یک دوربین دارند."""
+        out = []
+        for row in self._rows:
+            cams = self._row_cameras(row)
+            if cams:
+                out.append({"cameras": cams})
+        return out
+
+    def _open_row(self, row):
+        cams = self._row_cameras(row)
+        if not cams:
+            QMessageBox.information(self, "اتاق مانیتورینگ",
+                                    "برای این پنجره هیچ دوربینی انتخاب نشده است.")
+            return
+        if self.on_open_window is not None:
+            self.on_open_window(cams)
+
+    def _on_open_all_clicked(self):
+        if self.on_open_all is not None:
+            self.on_open_all(self.window_configs())
+
+    def _on_close_all_clicked(self):
+        if self.on_close_all is not None:
+            self.on_close_all()
 
     def _on_save_clicked(self):
         if self._save_callback is not None:
-            ok = self._save_callback(self.current_layout())
+            ok = self._save_callback()
             QMessageBox.information(
                 self, "اتاق مانیتورینگ",
                 "چیدمان ذخیره شد." if ok else "خطا در ذخیره‌ی چیدمان.")
-
-    def _on_open_clicked(self):
-        if self._on_open is not None:
-            self._on_open(self.current_layout())
-
-    def _on_close_all_clicked(self):
-        if self._on_close_all is not None:
-            self._on_close_all()
 
 
 class MonitorRoomManager:
@@ -352,39 +451,77 @@ class MonitorRoomManager:
         self.camera_store = camera_store
         self.face_engine = face_engine
         self.store = MonitorLayoutStore()
-        self.windows = []
+        self.windows = []  # list of {"window": MonitorWindow, "cameras": [...]}
+        self._win_counter = 0
+        self._cascade = 0
 
     def open_setup_dialog(self, parent):
         cameras = self.camera_store.get_cameras()
-        saved = self.store.load()
-        dlg = MonitorRoomDialog(cameras, saved, self.open_all, self.close_all, parent)
-        dlg.set_save_callback(self.store.save)
+        saved = self.store.load().get("windows", [])
+        dlg = MonitorRoomDialog(cameras, saved, parent)
+        dlg.on_open_window = self.open_window
+        dlg.on_open_all = self.open_all_configs
+        dlg.on_close_all = self.close_all
+        dlg.set_save_callback(self.save_current_layout)
         dlg.exec()
 
-    def open_all(self, layout):
-        self.close_all()
-        screens = {name: scr for name, _geo, scr in list_screens()}
+    def _next_title(self):
+        self._win_counter += 1
+        return f"🖥 اتاق مانیتورینگ — پنجره‌ی {self._win_counter}"
+
+    def _on_window_closed(self, win):
+        self.windows = [e for e in self.windows if e["window"] is not win]
+
+    def open_window(self, cam_ids, geometry=None, fullscreen=False):
+        """باز کردن یک پنجره‌ی جدید (movable/resizable) با دوربین‌های داده‌شده."""
         cameras_by_id = {c.get("id"): c for c in self.camera_store.get_cameras()}
-        build_rtsp_url = self.camera_store.build_rtsp_url
-        for entry in (layout or {}).get("screens", []):
-            if not isinstance(entry, dict):
-                continue
-            scr = screens.get(entry.get("screen"))
-            if scr is None:
-                continue
-            cam_ids = [cid for cid in (entry.get("cameras") or [])
-                       if cid in cameras_by_id]
-            if not cam_ids:
-                continue
-            win = MonitorWindow(entry.get("screen"), cam_ids, cameras_by_id,
-                                build_rtsp_url, self.face_engine)
-            win.show_on_screen(scr, fullscreen=bool(entry.get("fullscreen", True)))
-            self.windows.append(win)
+        cam_ids = [cid for cid in (cam_ids or []) if cid in cameras_by_id]
+        if not cam_ids:
+            return None
+        win = MonitorWindow(
+            self._next_title(), cam_ids, cameras_by_id,
+            self.camera_store.build_rtsp_url, self.face_engine,
+            on_closed=self._on_window_closed)
+        if geometry is None:
+            # آبشاری روی صفحه‌ی اصلی تا پنجره‌ها روی هم نیفتند
+            try:
+                primary = QApplication.primaryScreen()
+                if primary is not None:
+                    top_left = primary.geometry().topLeft()
+                    off = (self._cascade % 8) * 36
+                    win.move(top_left + QPoint(60 + off, 60 + off))
+                    self._cascade += 1
+            except Exception:
+                pass
+        win.show_initial(geometry=geometry, fullscreen=fullscreen)
+        self.windows.append({"window": win, "cameras": list(cam_ids)})
+        return win
+
+    def open_all_configs(self, configs):
+        self.close_all()
+        for cfg in configs or []:
+            if isinstance(cfg, dict):
+                self.open_window((cfg or {}).get("cameras") or [])
 
     def close_all(self):
         wins, self.windows = self.windows, []
-        for win in wins:
+        for entry in wins:
             try:
-                win.close()
+                entry["window"].close()
             except Exception:
                 pass
+
+    def save_current_layout(self):
+        """ذخیره‌ی چیدمان: وضعیت واقعی پنجره‌های باز (دوربین‌ها + موقعیت/اندازه
+        + تمام‌صفحه). اگر پنجره‌ای باز نیست، چیزی برای ذخیره نیست."""
+        windows = []
+        for entry in self.windows:
+            try:
+                win = entry["window"]
+                st = win.window_state()
+                windows.append({"cameras": list(entry["cameras"]),
+                                "geometry": st.get("geometry"),
+                                "fullscreen": bool(st.get("fullscreen"))})
+            except Exception:
+                continue
+        return self.store.save({"version": 2, "windows": windows})
