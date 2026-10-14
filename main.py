@@ -2792,6 +2792,16 @@ class MainWindow(QMainWindow):
         self.people_toggle_btn.toggled.connect(self._on_people_toggle_all)
         grid_toolbar.addWidget(self.people_toggle_btn)
 
+        # (1.1.0) اتاق مانیتورینگ (multi-monitor): تقسیم نمایش دوربین‌ها روی
+        # چند مانیتور — دیالوگ تنظیم + پنجره‌ی نمایش جداگانه برای هر مانیتور.
+        self.monitor_room_btn = QPushButton("🖥 اتاق مانیتورینگ")
+        self.monitor_room_btn.setToolTip("تقسیم نمایش دوربین‌ها روی چند مانیتور (اتاق مانیتورینگ)")
+        self.monitor_room_btn.setStyleSheet(
+            "QPushButton{background:#333; color:#ccc; border-radius:4px; padding:3px 8px; font-size:11px;}"
+        )
+        self.monitor_room_btn.clicked.connect(self._on_monitor_room_clicked)
+        grid_toolbar.addWidget(self.monitor_room_btn)
+
         # (2.0.12-beta به دستور کاربر، اصلاح‌شده در 2.0.14-beta): دکمه‌های
         # مربوط به رسم - «نوع رسم» (تشخیص خودکار/AI) فقط در حالت رسم، و
         # «تایید»/«لغو» فقط وقتی محدوده‌ای رسم شده (در انتظار) یا در حال
@@ -3227,6 +3237,20 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self.camera_grid.set_people_counting_all(checked)
+
+    def _on_monitor_room_clicked(self):
+        """(1.1.0) اتاق مانیتورینگ: دیالوگ تنظیم تقسیم دوربین‌ها روی چند مانیتور."""
+        try:
+            from monitor_room import MonitorRoomManager
+        except Exception as e:
+            QMessageBox.warning(self, "خطا", f"بارگذاری اتاق مانیتورینگ ممکن نشد:\n{e}")
+            return
+        if getattr(self, "_monitor_room_mgr", None) is None:
+            self._monitor_room_mgr = MonitorRoomManager(self.camera_store, self.face_engine)
+        try:
+            self._monitor_room_mgr.open_setup_dialog(self)
+        except Exception as e:
+            QMessageBox.warning(self, "خطا", f"باز کردن اتاق مانیتورینگ ممکن نشد:\n{e}")
 
     # ----------------------------------------------------- محدوده‌ی هشدار --
 
