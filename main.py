@@ -2861,7 +2861,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "خطا", f"بارگذاری اتاق مانیتورینگ ممکن نشد:\n{e}")
             return
         if getattr(self, "_monitor_room_mgr", None) is None:
-            self._monitor_room_mgr = MonitorRoomManager(self.camera_store, self.face_engine)
+            self._monitor_room_mgr = MonitorRoomManager(
+                self.camera_store, self.face_engine, report_store=report_store,
+                on_person_toggle=self._on_camera_person_toggle)
         try:
             self._monitor_room_mgr.open_setup_dialog(self)
         except Exception as e:
