@@ -20,16 +20,16 @@ import json
 import os
 from datetime import datetime, timedelta
 
-from PyQt6.QtCore import Qt, QEvent, QPoint
+from PyQt6.QtCore import Qt, QEvent, QPoint, QTimer
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QGridLayout, QGroupBox, QHBoxLayout,
+    QApplication, QDialog, QGroupBox, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPushButton, QScrollArea, QVBoxLayout, QWidget, QToolBar, QDockWidget,
+    QPushButton, QScrollArea, QVBoxLayout, QWidget, QToolBar,
 )
 
 from app_paths import get_data_dir
-from camera_page import CameraPageWidget
+from main_page import MainPageWidget
 
 LAYOUT_FILENAME = "monitor_layout.json"
 
@@ -104,13 +104,13 @@ class MonitorLayoutStore:
 class MonitorWindow(QMainWindow):
     """پنجره‌ی نمایش مستقل اتاق مانیتورینگ — کپی کامل صفحه‌ی اصلی.
 
-    (1.2.0) بازطراحی از نو به دستور طه: به‌جای تایل‌های سبک و نوار ابزار
-    جداگانه، از CameraWallWidget مشترک (camera_wall.py) استفاده می‌کند —
-    همان ظاهر، چیدمان و همه‌ی دکمه‌های صفحه‌ی اصلی (single source of truth).
-    کال‌بک‌های رویداد None هستند تا رویدادها تکراری ثبت نشوند؛ همه‌ی دکمه‌های
-    مدیریتی (رسم/مدیریت محدوده، شمارش افراد، صدای زنده، زوم دیجیتال، چیدمان)
-    کاملاً کار می‌کنند.
-    افزونه‌های نما (مخصوص این پنجره): پنل رویدادها + دکمه‌ی کنسول کامل.
+    (1.2.0) بازطراحی به دستور طه: کل لایه‌ی صفحه‌ی اصلی (چپ + وسط + راست)
+    از MainPageWidget مشترک (main_page.py) ساخته می‌شود — همان ظاهر، چیدمان
+    و همه‌ی دکمه‌ها و قابلیت‌ها (single source of truth). داده‌ها مشترک‌اند
+    (همان camera_store و report_store).
+    کال‌بک‌های رویداد None هستند تا رویدادها تکراری ثبت نشوند؛ پنل رویدادها
+    از report_store مشترک خوانده می‌شود.
+    افزونه‌ی مخصوص نما: دکمه‌ی «🎛 کنسول» برای باز کردن کنسول کامل دوربین.
 
     کاملاً movable و resizable؛ F11 یا دابل‌کلیک: تمام‌صفحه.
     """
@@ -118,7 +118,8 @@ class MonitorWindow(QMainWindow):
     def __init__(self, title, cam_ids, cameras_by_id, build_rtsp_url,
                  face_engine, on_closed=None, parent=None,
                  camera_store=None, report_store=None, on_person_toggle=None,
-                 on_open_monitor_room=None):
+                 on_open_monitor_room=None, alarm_player=None, building_fire=None,
+                 on_building_fire_log=None):
         super().__init__(parent)
         self._on_closed = on_closed
         self.camera_store = camera_store
@@ -128,26 +129,27 @@ class MonitorWindow(QMainWindow):
                          if cid in (cameras_by_id or {})]
         self.setWindowTitle(title)
 
-        # دیوار دوربین‌ها — همان UI صفحه‌ی اصلی.
-        self.wall = CameraPageWidget(
+        # کل صفحه‌ی اصلی — همان کامپوننت‌های مشترک.
+        self.page = MainPageWidget(
             face_engine, camera_store,
             on_open_monitor_room=on_open_monitor_room,
             on_people_toggle_all=self._on_wall_people_toggle_all,
+            alarm_player=alarm_player, building_fire=building_fire,
+            on_building_fire_log=on_building_fire_log,
+            report_store=report_store,
             parent=self,
         )
-        self.setCentralWidget(self.wall)
+        self.setCentralWidget(self.page)
         cams = [(cameras_by_id or {})[cid] for cid in self._cam_ids]
-        self.wall.set_cameras(cams, build_rtsp_url)
-        self.wall.selection_changed.connect(lambda _i: self._refresh_events())
+        self.page.camera_page.set_cameras(cams, build_rtsp_url)
 
-        # نوار افزونه‌های نما: پنل رویدادها + کنسول کامل.
+        # سازگاری: wall به صفحه‌ی مرکزی اشاره می‌کند.
+        self.wall = self.page.camera_page
+
+        # نوار افزونه‌ی نما: دکمه‌ی کنسول کامل.
         extras = QToolBar("افزونه‌های نما")
         extras.setMovable(False)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, extras)
-        self.events_btn = QPushButton("📋 رویدادها")
-        self.events_btn.setToolTip("پنل رویدادهای مرتبط با دوربین انتخاب‌شده")
-        self.events_btn.clicked.connect(self._toggle_events_dock)
-        extras.addWidget(self.events_btn)
         self.console_btn = QPushButton("🎛 کنسول")
         self.console_btn.setToolTip(
             "باز کردن کنسول کامل مدیریت دوربین برای دوربین انتخاب‌شده\n"
@@ -155,19 +157,18 @@ class MonitorWindow(QMainWindow):
         self.console_btn.clicked.connect(self._open_full_console)
         extras.addWidget(self.console_btn)
 
-        # داک رویدادها (مخفی پیش‌فرض).
-        self.events_dock = QDockWidget("رویدادهای دوربین", self)
-        self.events_dock.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea |
-                                         Qt.DockWidgetArea.LeftDockWidgetArea)
-        dock_w = QWidget()
-        dock_layout = QVBoxLayout(dock_w)
-        dock_layout.addWidget(QLabel("رویدادهای مرتبط (دابل‌کلیک = باز کردن کنسول در آن لحظه):"))
-        self.event_list = QListWidget()
-        self.event_list.itemDoubleClicked.connect(self._on_event_double_clicked)
-        dock_layout.addWidget(self.event_list, 1)
-        self.events_dock.setWidget(dock_w)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.events_dock)
-        self.events_dock.hide()
+        # دابل‌کلیک روی رویداد = باز کردن کنسول در آن لحظه.
+        try:
+            self.page.events_panel.events_panel_list.itemDoubleClicked.connect(
+                self._on_event_double_clicked)
+        except Exception:
+            pass
+
+        # تازه‌سازی دوره‌ای پنل رویدادها از report_store مشترک.
+        self._events_timer = QTimer(self)
+        self._events_timer.timeout.connect(self._refresh_events_panel)
+        self._events_timer.start(30000)
+        self._refresh_events_panel()
 
         # F11: تمام‌صفحه؛ دابل‌کلیک روی هرجای پنجره هم همین کار را می‌کند.
         self._fs_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
@@ -194,84 +195,43 @@ class MonitorWindow(QMainWindow):
             return None
 
     # ------------------------------------------------------------ رویدادها --
-    def _toggle_events_dock(self):
+    def _refresh_events_panel(self):
         try:
-            if self.events_dock.isVisible():
-                self.events_dock.hide()
-            else:
-                self._refresh_events()
-                self.events_dock.show()
+            self.page.events_panel.refresh_from_report_store(limit=100)
         except Exception:
             pass
 
-    def _refresh_events(self):
-        try:
-            self.event_list.clear()
-        except Exception:
-            return
-        if self.report_store is None:
-            return
-        cam = self._selected_cam()
-        cam_name = (cam or {}).get("name")
-        if not cam_name:
-            return
-        try:
-            now = datetime.now()
-            start_s = (now - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
-            end_s = now.strftime("%Y-%m-%d %H:%M:%S")
-            rows = self.report_store.query(start=start_s, end=end_s,
-                                           camera_name=cam_name, limit=100)
-        except Exception:
-            rows = []
-        for row in rows or []:
-            try:
-                ts, event_type = row[0], row[1]
-                item = QListWidgetItem(f"{str(ts)[11:19]} — {event_type}")
-                item.setData(Qt.ItemDataRole.UserRole, str(ts))
-                self.event_list.addItem(item)
-            except Exception:
-                continue
-
     def _on_event_double_clicked(self, item):
-        """دابل‌کلیک روی رویداد = باز کردن کنسول مدیریت دوربین در آن لحظه
-        (اگر دوربین کانال NVR باشد)."""
-        ts = item.data(Qt.ItemDataRole.UserRole)
-        cam = self._selected_cam()
+        """دابل‌کلیک روی رویداد = باز کردن کنسول مدیریت دوربین در آن لحظه."""
+        try:
+            ts = item.data(Qt.ItemDataRole.UserRole)
+            text = item.text()
+        except Exception:
+            return
+        cam = self._find_cam_for_event(text)
+        if cam is None:
+            cam = self._selected_cam()
         if cam is None:
             return
         try:
-            event_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+            event_dt = datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S")
         except Exception:
-            return
-        nvr_id = cam.get("nvr_id")
-        channel = cam.get("channel")
-        if not nvr_id or channel is None or self.camera_store is None:
-            QMessageBox.information(
-                self, "رویداد",
-                "این دوربین کانال NVR نیست؛ کنسول پخش بازبینی فقط برای کانال‌های NVR است.")
-            return
-        try:
-            nvr = self.camera_store.get_nvr(nvr_id)
-        except Exception:
-            nvr = None
-        if not nvr:
-            return
-        try:
-            from nvr_console_dialog import NVRConsoleDialog
-            dlg = NVRConsoleDialog(
-                nvr, channel,
-                event_dt - timedelta(seconds=10), event_dt + timedelta(seconds=30),
-                camera_label=cam.get("name", ""), parent=self,
-                camera_store=self.camera_store, report_store=self.report_store,
-                on_person_toggle=self._on_person_toggle)
-            dlg.exec()
-        except Exception as e:
-            QMessageBox.warning(self, "خطا", f"باز کردن کنسول ممکن نشد:\n{e}")
+            event_dt = None
+        self._open_console_for_cam(cam, event_dt)
 
-    def _open_full_console(self):
-        """دکمه‌ی «کنسول کامل»: باز کردن NVRConsoleDialog برای دوربین
-        انتخاب‌شده در لبه‌ی زنده (۴۰ ثانیه‌ی اخیر) — فقط کانال‌های NVR."""
-        cam = self._selected_cam()
+    def _find_cam_for_event(self, text):
+        try:
+            for cid in self._cam_ids:
+                c = (self.camera_store.get_camera(cid) if self.camera_store else None)
+                if c and c.get("name") and c["name"] in str(text):
+                    return c
+        except Exception:
+            pass
+        return None
+
+
+    def _open_console_for_cam(self, cam, event_dt=None):
+        """باز کردن کنسول NVR برای دوربین؛ event_dt لحظه‌ی رویداد (اختیاری)."""
         nvr_id = (cam or {}).get("nvr_id")
         channel = (cam or {}).get("channel")
         if not nvr_id or channel is None or self.camera_store is None:
@@ -287,15 +247,25 @@ class MonitorWindow(QMainWindow):
             return
         try:
             from nvr_console_dialog import NVRConsoleDialog
-            now = datetime.now()
+            if event_dt is None:
+                now = datetime.now()
+                start_dt, end_dt = now - timedelta(seconds=40), now
+            else:
+                start_dt = event_dt - timedelta(seconds=10)
+                end_dt = event_dt + timedelta(seconds=30)
             dlg = NVRConsoleDialog(
-                nvr, channel, now - timedelta(seconds=40), now,
+                nvr, channel, start_dt, end_dt,
                 camera_label=(cam or {}).get("name", ""), parent=self,
                 camera_store=self.camera_store, report_store=self.report_store,
                 on_person_toggle=self._on_person_toggle)
             dlg.exec()
         except Exception as e:
             QMessageBox.warning(self, "خطا", f"باز کردن کنسول ممکن نشد:\n{e}")
+
+    def _open_full_console(self):
+        """دکمه‌ی «کنسول کامل»: باز کردن NVRConsoleDialog برای دوربین
+        انتخاب‌شده در لبه‌ی زنده (۴۰ ثانیه‌ی اخیر) — فقط کانال‌های NVR."""
+        self._open_console_for_cam(self._selected_cam())
 
     # ------------------------------------------------- پنجره (مثل قبل) --
     def eventFilter(self, obj, event):
@@ -352,8 +322,6 @@ class MonitorWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
-
-
 
 class MonitorRoomDialog(QDialog):
     """دیالوگ تنظیم اتاق مانیتورینگ: مدیریت پنجره‌ها و دوربین‌های هر پنجره."""
@@ -509,11 +477,15 @@ class MonitorRoomManager:
     """مدیریت پنجره‌های اتاق مانیتورینگ — ساخته و نگه‌داری توسط MainWindow."""
 
     def __init__(self, camera_store, face_engine, report_store=None,
-                 on_person_toggle=None):
+                 on_person_toggle=None, alarm_player=None, building_fire=None,
+                 on_building_fire_log=None):
         self.camera_store = camera_store
         self.face_engine = face_engine
         self.report_store = report_store
         self._on_person_toggle = on_person_toggle
+        self._alarm_player = alarm_player
+        self._building_fire = building_fire
+        self._on_building_fire_log = on_building_fire_log
         self.store = MonitorLayoutStore()
         self.windows = []  # list of {"window": MonitorWindow, "cameras": [...]}
         self._win_counter = 0
@@ -556,7 +528,9 @@ class MonitorRoomManager:
             on_closed=self._on_window_closed,
             camera_store=self.camera_store, report_store=self.report_store,
             on_person_toggle=self._on_person_toggle,
-            on_open_monitor_room=self._open_setup_for_window)
+            on_open_monitor_room=self._open_setup_for_window,
+            alarm_player=self._alarm_player, building_fire=self._building_fire,
+            on_building_fire_log=self._on_building_fire_log)
         if geometry is None:
             # آبشاری روی صفحه‌ی اصلی تا پنجره‌ها روی هم نیفتند
             try:
