@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 
 from report_store import EVENT_TYPE_LABELS_FA
 from plate_store import plate_store
-from nvr_playback_dialog import NVRPlaybackDialog
+from nvr_console_dialog import NVRConsoleDialog
 
 # چند ثانیه قبل/بعد از لحظه‌ی ثبت‌شده‌ی هر رویداد که برای پخش بازبینی از NVR
 # درخواست می‌شود - چون ساعت رویداد دقیقاً لحظه‌ی تشخیص در برنامه است، نه
@@ -413,7 +413,9 @@ class ReportsPage(QWidget):
             return
         start_dt = event_dt - PLAYBACK_MARGIN_BEFORE
         end_dt = event_dt + PLAYBACK_MARGIN_AFTER
-        dialog = NVRPlaybackDialog(nvr, channel, start_dt, end_dt, camera_label=camera_name, parent=self)
+        dialog = NVRConsoleDialog(
+            nvr, channel, start_dt, end_dt, camera_label=camera_name, parent=self,
+            camera_store=self.camera_store, report_store=self.report_store)
         dialog.exec()
 
     def export_csv(self):
