@@ -3925,6 +3925,7 @@ class MainWindow(QMainWindow):
                 pwd=data["pass"], brand=data["brand"],
                 camera_brand=data["camera_brand"],
                 group=data.get("group", ""),
+                use_https=data.get("use_https", False),
             )
             added_cams = [
                 self._add_channel_from_entry(nvr, entry, default_name)

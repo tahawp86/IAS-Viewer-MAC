@@ -98,19 +98,129 @@ def macos_keychain_available() -> bool:
 
 
 def macos_keychain_set(account: str, secret: str) -> bool:
-    """ذخیره‌ی رمز در Keychain کاربر جاری. True اگر موفق بود."""
-    sec = _security()
-    if not sec:
+    """ذخیره‌ی رمز در Keychain کاربر جاری. True اگر موفق بود.
+
+    (1.2.0 - بلاکر امنیتی به گزارش IVDagent) بازنویسی با ctypes و
+    Security.framework به‌جای پروسس `security`: رمز هرگز در argv هیچ پروسسی
+    قرار نمی‌گیرد (نسخه‌ی قبلی آن را با فلگ -w به خط فرمان می‌داد که در
+    خروجی ps برای هر پروسس محلی قابل مشاهده بود). هیچ وابستگی جدیدی ندارد.
+    رفتار -U حفظ شده: اگر آیتم تکراری بود، مقدارش آپدیت می‌شود
+    (SecKeychainFindGenericPassword + SecKeychainItemModifyAttributesAndData).
+    """
+    if not account or not secret:
         return False
     try:
-        r = subprocess.run(
-            [sec, "add-generic-password", "-U",
-             "-s", _KEYCHAIN_SERVICE, "-a", account, "-w", secret],
-            capture_output=True, timeout=15,
+        import ctypes
+        sec = _security_framework()
+        if sec is None:
+            return False
+        service_b = _KEYCHAIN_SERVICE.encode("utf-8")
+        account_b = account.encode("utf-8")
+        secret_b = secret.encode("utf-8")
+
+        sec.SecKeychainAddGenericPassword.restype = ctypes.c_int32
+        sec.SecKeychainAddGenericPassword.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p,
+            ctypes.c_uint32, ctypes.c_char_p,
+            ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        status = sec.SecKeychainAddGenericPassword(
+            None, len(service_b), service_b,
+            len(account_b), account_b,
+            len(secret_b), secret_b, None,
         )
-        return r.returncode == 0
+        if status == 0:
+            return True
+        if status != _ERR_SEC_DUPLICATE_ITEM:
+            return False
+        # آیتم تکراری است: پیداش کن و مقدار را آپدیت کن (معادل فلگ -U).
+        sec.SecKeychainFindGenericPassword.restype = ctypes.c_int32
+        sec.SecKeychainFindGenericPassword.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p,
+            ctypes.c_uint32, ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        password_len = ctypes.c_uint32(0)
+        password_data = ctypes.c_void_p(None)
+        item_ref = ctypes.c_void_p(None)
+        status = sec.SecKeychainFindGenericPassword(
+            None, len(service_b), service_b,
+            len(account_b), account_b,
+            ctypes.byref(password_len), ctypes.byref(password_data),
+            ctypes.byref(item_ref),
+        )
+        try:
+            if status != 0 or not item_ref.value:
+                return False
+            sec.SecKeychainItemModifyAttributesAndData.restype = ctypes.c_int32
+            sec.SecKeychainItemModifyAttributesAndData.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_uint32, ctypes.c_void_p,
+            ]
+            status = sec.SecKeychainItemModifyAttributesAndData(
+                item_ref, None, len(secret_b), secret_b)
+            return status == 0
+        finally:
+            try:
+                if password_data.value:
+                    sec.SecKeychainItemFreeContent.restype = ctypes.c_int32
+                    sec.SecKeychainItemFreeContent.argtypes = [
+                        ctypes.c_void_p, ctypes.c_void_p]
+                    sec.SecKeychainItemFreeContent(None, password_data)
+            except Exception:
+                pass
+            _cf_release(item_ref.value)
     except Exception:
         return False
+
+
+def _security_framework():
+    """لود Security.framework با ctypes (کش‌شده)؛ None اگر ممکن نبود."""
+    global _SECURITY_FW
+    try:
+        fw = _SECURITY_FW
+    except NameError:
+        fw = None
+    if fw is not None:
+        return fw
+    if not is_macos():
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+        path = ctypes.util.find_library("Security")
+        if not path:
+            path = "/System/Library/Frameworks/Security.framework/Security"
+        fw = ctypes.CDLL(path)
+        _SECURITY_FW = fw
+        return fw
+    except Exception:
+        return None
+
+
+def _cf_release(ptr):
+    """CFRelease روی یک ref؛ خطا بی‌صدا."""
+    if not ptr:
+        return
+    try:
+        import ctypes
+        import ctypes.util
+        cf_path = ctypes.util.find_library("CoreFoundation")
+        if not cf_path:
+            cf_path = ("/System/Library/Frameworks/CoreFoundation.framework/"
+                       "CoreFoundation")
+        cf = ctypes.CDLL(cf_path)
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        cf.CFRelease.restype = None
+        cf.CFRelease(ptr)
+    except Exception:
+        pass
+
+
+# errSecDuplicateItem از SecBase.h — برای منطق «آپدیت در صورت تکراری بودن».
+_ERR_SEC_DUPLICATE_ITEM = -25299
 
 
 def macos_keychain_get(account: str) -> str | None:
