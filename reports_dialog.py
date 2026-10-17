@@ -368,7 +368,8 @@ class ReportsPage(QWidget):
             # هیچ NVR ای برای این دوربین پیدا نشود، با کلیک روی دکمه پیام
             # روشن نمایش داده می‌شود (نه اینکه از همان اول دکمه پنهان بماند).
             if self.camera_store is not None:
-                play_btn = QPushButton("▶ پخش از NVR")
+                # (1.2.0) دکمه‌ی «گزارش ویدیویی» کنار هر ردیف گزارش/آلارم.
+                play_btn = QPushButton("🎬 گزارش ویدیویی")
                 play_btn.clicked.connect(
                     lambda _checked=False, _ts=ts, _nvr_id=nvr_id, _ch=channel, _cam=camera:
                     self._open_nvr_playback(_ts, _nvr_id, _ch, _cam)

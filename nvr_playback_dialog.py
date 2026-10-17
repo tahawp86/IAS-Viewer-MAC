@@ -10,6 +10,7 @@
 """
 
 import cv2
+import webbrowser
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
@@ -18,6 +19,22 @@ from PyQt6.QtWidgets import (
 
 from rtsp_utils import open_capture
 from nvr_playback import build_playback_urls
+
+
+def nvr_web_url(nvr: dict) -> str | None:
+    """آدرس پنل وب NVR برای فالبک «باز کردن وب NVR».
+
+    فقط scheme+host است (بدون پورت سفارشی، بدون هیچ کریدنشنالی) — کاربر در
+    مرورگر خودش لاگین می‌کند و به بازه‌ی زمانی رویداد می‌رود.
+    """
+    try:
+        ip = (nvr or {}).get("ip", "").strip()
+        if not ip:
+            return None
+        scheme = "https" if (nvr or {}).get("use_https") else "http"
+        return f"{scheme}://{ip}"
+    except Exception:
+        return None
 
 # همان گزینه‌های کم‌تاخیر پخش زنده (rtsp_utils.STREAM_FFMPEG_OPTS) برای پخش
 # بازبینی هم مناسب است؛ فقط stimeout کمی بیشتر است چون خیلی از NVRها برای
@@ -147,6 +164,17 @@ class NVRPlaybackDialog(QDialog):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
+        # (1.2.0) فالبک «باز کردن وب NVR»: اگر پخش داخل‌برنامه‌ای (RTSP
+        # بازبینی) ممکن نشد، این دکمه نمایش داده می‌شود تا کاربر پنل وب NVR
+        # را در مرورگر باز کند و خودش به بازه‌ی زمانی رویداد برود.
+        self._nvr = nvr
+        self.web_btn = QPushButton("🌐 باز کردن وب NVR")
+        self.web_btn.setToolTip(
+            "پخش داخل برنامه ممکن نشد؛ پنل وب NVR در مرورگر باز می‌شود.\n"
+            "بعد از ورود، در بخش Playback به بازه‌ی زمانی بالای پنجره بروید.")
+        self.web_btn.clicked.connect(self._on_open_nvr_web)
+        self.web_btn.hide()
+        btn_row.addWidget(self.web_btn)
         close_btn = QPushButton("بستن")
         close_btn.clicked.connect(self.reject)
         btn_row.addWidget(close_btn)
@@ -181,6 +209,22 @@ class NVRPlaybackDialog(QDialog):
     def _on_error(self, msg):
         self.video_label.setText(msg)
         self.status_label.setText("")
+        # (1.2.0) فالبک وب: وقتی پخش RTSP ممکن نیست، راه مرورگر را نشان بده.
+        try:
+            if nvr_web_url(self._nvr):
+                self.web_btn.show()
+        except Exception:
+            pass
+
+    def _on_open_nvr_web(self):
+        """باز کردن پنل وب NVR در مرورگر سیستم (فالبک پخش بازبینی)."""
+        url = nvr_web_url(self._nvr)
+        if not url:
+            return
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
 
     def _stop_thread(self):
         """(2.0.16-beta - پایداری) توقف امن ترد پخش هنگام بسته شدن دیالوگ.
