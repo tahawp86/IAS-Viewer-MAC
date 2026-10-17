@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""monitor_room.py — اتاق مانیتورینگ (multi-monitor) نسخه‌ی مک (1.1.1).
+"""monitor_room.py — اتاق مانیتورینگ (multi-monitor) نسخه‌ی مک (1.2.0).
 
 قابلیت «اتاق مانیتورینگ»: تقسیم تصاویر دوربین‌ها روی چند مانیتور متصل به سیستم.
 - شناسایی مانیتورها با QApplication.screens() (نمایشی، برای راهنمایی کاربر)
@@ -10,34 +10,28 @@
   هر پنجره)؛ بعد از بستن و باز کردن برنامه، چیدمان بازیابی می‌شود.
   (چیدمان قدیمی نسخه‌ی 1.1.0 به‌صورت خودکار مهاجرت می‌کند.)
 
-نکته‌ی طراحی: تایل‌های این پنجره‌ها فقط «نمایش» می‌دهند — هر تایل استریم
-مستقیم خودش را باز می‌کند (CameraStreamThread) ولی هیچ callback رویدادی
-(چهره/پلاک/حریق/شخص) وصل نمی‌شود تا رویدادها تکراری ثبت نشوند.
+(1.2.0) بازطراحی از نو به دستور طه: پنجره‌های «نما» کپی کامل صفحه‌ی اصلی‌اند —
+از CameraPageWidget مشترک (camera_page.py) استفاده می‌کنند؛ همان ظاهر، چیدمان
+و همه‌ی دکمه‌ها (single source of truth). کال‌بک‌های رویداد None هستند تا
+رویدادها تکراری ثبت نشوند.
 """
 
 import json
-import math
 import os
-import time
-import uuid
 from datetime import datetime, timedelta
 
-import cv2
-from PyQt6.QtCore import Qt, QEvent, QPoint, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QKeySequence, QShortcut
+from PyQt6.QtCore import Qt, QEvent, QPoint
+from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QGridLayout, QGroupBox, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPushButton, QScrollArea, QVBoxLayout, QWidget, QToolBar, QDockWidget,
-    QTabWidget, QComboBox, QInputDialog,
 )
 
 from app_paths import get_data_dir
-from camera_stream import CameraStreamThread
-from video_display_label import VideoDisplayLabel
+from camera_page import CameraPageWidget
 
 LAYOUT_FILENAME = "monitor_layout.json"
-_DISPLAY_FPS = 15.0
 
 
 def _bgr_to_pixmap(frame):
@@ -107,596 +101,109 @@ class MonitorLayoutStore:
             return False
 
 
-class MonitorTileWidget(QWidget):
-    """تایل نمایشی اتاق مانیتورینگ: تصویر زنده + وضعیت اتصال + ابزارهای مدیریتی.
-
-    (1.2.0) برای دکمه‌های مدیریتی پنجره‌ی نما: رسم محدوده (VideoDisplayLabel
-    مشترک)، زوم دیجیتال و انتخاب تایل. استریم نمایشی می‌ماند — هیچ callback
-    رویدادی وصل نمی‌شود تا رویدادها تکراری ثبت نشوند.
-    """
-
-    selected = pyqtSignal(object)
-
-    _ZOOM_MIN, _ZOOM_MAX = 1.0, 8.0
-
-    def __init__(self, cam: dict, rtsp_url: str, face_engine, parent=None):
-        super().__init__(parent)
-        self.cam = cam
-        self._last_display_ts = 0.0
-        self.stream_thread = None
-        self._zoom = 1.0
-        self._zoom_center = (0.5, 0.5)
-        self._is_selected = False
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(2, 2, 2, 2)
-        lay.setSpacing(2)
-
-        header = QHBoxLayout()
-        self.name_label = QLabel(cam.get("name") or cam.get("ip", ""))
-        self.name_label.setStyleSheet("font-weight: bold; font-size: 12px;")
-        self.status_label = QLabel("در حال اتصال...")
-        self.status_label.setStyleSheet("color: #aaa; font-size: 11px;")
-        header.addWidget(self.name_label)
-        header.addStretch()
-        header.addWidget(self.status_label)
-        lay.addLayout(header)
-
-        self.video_label = VideoDisplayLabel("در انتظار تصویر...")
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setStyleSheet("background: #000; color: #888;")
-        self.video_label.setMinimumSize(160, 120)
-        lay.addWidget(self.video_label, 1)
-        try:
-            self.video_label.set_confirmed_regions(cam.get("regions") or [])
-        except Exception:
-            pass
-        # کلیک روی لیبل هم تایل را انتخاب کند (بدون بلاک کردن رسم محدوده).
-        self.video_label.installEventFilter(self)
-        self.name_label.installEventFilter(self)
-
-        # مثل تایل‌های اصلی: هر تایل استریم خودش را دارد؛ فقط callbackهای
-        # رویداد (چهره/پلاک/حریق/شخص) وصل نمی‌شود — نمایش صرف.
-        self.stream_thread = CameraStreamThread(rtsp_url, face_engine)
-        try:
-            self.stream_thread.set_person_tracking(bool(cam.get("person_tracking")))
-        except Exception:
-            pass
-        self.stream_thread.frame_ready.connect(self._on_frame_ready)
-        self.stream_thread.error_signal.connect(self._on_error)
-        self.stream_thread.connected_signal.connect(self._on_connected)
-        self.stream_thread.stream_status_signal.connect(self._on_stream_status)
-        self.stream_thread.start()
-
-    # ------------------------------------------------------------- انتخاب --
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.MouseButtonPress:
-            self.selected.emit(self)
-        return super().eventFilter(obj, event)
-
-    def mousePressEvent(self, event):
-        self.selected.emit(self)
-        super().mousePressEvent(event)
-
-    def set_selected(self, on: bool):
-        self._is_selected = bool(on)
-        if on:
-            self.setStyleSheet("QWidget { border: 2px solid #4da3ff; border-radius: 4px; }")
-        else:
-            self.setStyleSheet("QWidget { border: 2px solid transparent; border-radius: 4px; }")
-
-    # ---------------------------------------------------------------- زوم --
-    def set_zoom(self, zoom: float):
-        self._zoom = min(self._ZOOM_MAX, max(self._ZOOM_MIN, float(zoom)))
-        if self._zoom <= 1.0:
-            self._zoom_center = (0.5, 0.5)
-
-    def zoom_step(self, direction: int):
-        self.set_zoom(self._zoom * (1.25 if direction > 0 else 0.8))
-
-    def _zoom_crop_origin(self):
-        zw = 1.0 / self._zoom
-        cx, cy = self._zoom_center
-        x0 = min(max(cx - zw / 2.0, 0.0), 1.0 - zw)
-        y0 = min(max(cy - zw / 2.0, 0.0), 1.0 - zw)
-        return (x0, y0, zw, zw)
-
-    def _on_frame_ready(self, display_frame, raw_frame):
-        # محدودیت نرخ نمایش (~۱۵ فریم‌برثانیه) مثل تایل اصلی.
-        now = time.monotonic()
-        if now - self._last_display_ts < 1.0 / _DISPLAY_FPS:
-            return
-        self._last_display_ts = now
-        frame = display_frame
-        try:
-            if self._zoom > 1.0:
-                h, w = frame.shape[:2]
-                x0, y0, zw, zh = self._zoom_crop_origin()
-                px0, py0 = int(x0 * w), int(y0 * h)
-                px1 = min(int((x0 + zw) * w), w)
-                py1 = min(int((y0 + zh) * h), h)
-                if px1 > px0 and py1 > py0:
-                    frame = frame[py0:py1, px0:px1]
-                self.video_label.set_zoom_crop_norm((x0, y0, zw, zh))
-            else:
-                self.video_label.set_zoom_crop_norm(None)
-            pixmap = _bgr_to_pixmap(frame)
-            if pixmap is not None:
-                self.video_label.setPixmap(pixmap.scaled(
-                    self.video_label.width(), self.video_label.height(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation))
-        except Exception:
-            pass
-
-    def _on_error(self, msg):
-        self.status_label.setText(f"خطا: {(msg or '')[:60]}")
-        self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
-
-    def _on_connected(self):
-        self.status_label.setText("متصل")
-        self.status_label.setStyleSheet("color: #2ecc71; font-size: 11px;")
-
-    def _on_stream_status(self, info):
-        try:
-            state = (info or {}).get("state", "")
-        except Exception:
-            state = ""
-        mapping = {
-            "connected": ("متصل", "#2ecc71"),
-            "reconnecting": ("در حال تلاش مجدد...", "#f39c12"),
-            "weak": ("سیگنال ضعیف", "#f39c12"),
-            "down": ("قطع", "#e74c3c"),
-        }
-        if state in mapping:
-            text, color = mapping[state]
-            self.status_label.setText(text)
-            self.status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
-
-    def stop(self):
-        th, self.stream_thread = self.stream_thread, None
-        if th is not None:
-            try:
-                th.stop()
-            except Exception:
-                pass
-
-
 class MonitorWindow(QMainWindow):
-    """پنجره‌ی نمایش مستقل اتاق مانیتورینگ — کاملاً movable و resizable.
+    """پنجره‌ی نمایش مستقل اتاق مانیتورینگ — کپی کامل صفحه‌ی اصلی.
 
-    کاربر با موس می‌گیرد و روی هر مانیتوری می‌اندازد؛ F11 یا دابل‌کلیک:
-    تمام‌صفحه.
+    (1.2.0) بازطراحی از نو به دستور طه: به‌جای تایل‌های سبک و نوار ابزار
+    جداگانه، از CameraWallWidget مشترک (camera_wall.py) استفاده می‌کند —
+    همان ظاهر، چیدمان و همه‌ی دکمه‌های صفحه‌ی اصلی (single source of truth).
+    کال‌بک‌های رویداد None هستند تا رویدادها تکراری ثبت نشوند؛ همه‌ی دکمه‌های
+    مدیریتی (رسم/مدیریت محدوده، شمارش افراد، صدای زنده، زوم دیجیتال، چیدمان)
+    کاملاً کار می‌کنند.
+    افزونه‌های نما (مخصوص این پنجره): پنل رویدادها + دکمه‌ی کنسول کامل.
+
+    کاملاً movable و resizable؛ F11 یا دابل‌کلیک: تمام‌صفحه.
     """
 
     def __init__(self, title, cam_ids, cameras_by_id, build_rtsp_url,
                  face_engine, on_closed=None, parent=None,
-                 camera_store=None, report_store=None, on_person_toggle=None):
+                 camera_store=None, report_store=None, on_person_toggle=None,
+                 on_open_monitor_room=None):
         super().__init__(parent)
-        self.tiles = []
         self._on_closed = on_closed
-        self._cam_ids = list(cam_ids or [])
-        self._cameras_by_id = dict(cameras_by_id or {})
-        self._build_rtsp_url = build_rtsp_url
-        self._face_engine = face_engine
         self.camera_store = camera_store
         self.report_store = report_store
         self._on_person_toggle = on_person_toggle
-        self._selected_tile = None
-        self._display_count = 0  # 0 = خودکار (همه)
-        self._listen_session = None
-        self._drawing = False
+        self._cam_ids = [cid for cid in (cam_ids or [])
+                         if cid in (cameras_by_id or {})]
         self.setWindowTitle(title)
-        central = QWidget()
-        self.setCentralWidget(central)
-        self.grid = QGridLayout(central)
-        self.grid.setContentsMargins(6, 6, 6, 6)
-        self.grid.setSpacing(6)
-        self._build_toolbar()
-        self._build_dock()
-        self._rebuild_tiles()
-        self._select_tile(self.tiles[0] if self.tiles else None)
+
+        # دیوار دوربین‌ها — همان UI صفحه‌ی اصلی.
+        self.wall = CameraPageWidget(
+            face_engine, camera_store,
+            on_open_monitor_room=on_open_monitor_room,
+            on_people_toggle_all=self._on_wall_people_toggle_all,
+            parent=self,
+        )
+        self.setCentralWidget(self.wall)
+        cams = [(cameras_by_id or {})[cid] for cid in self._cam_ids]
+        self.wall.set_cameras(cams, build_rtsp_url)
+        self.wall.selection_changed.connect(lambda _i: self._refresh_events())
+
+        # نوار افزونه‌های نما: پنل رویدادها + کنسول کامل.
+        extras = QToolBar("افزونه‌های نما")
+        extras.setMovable(False)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, extras)
+        self.events_btn = QPushButton("📋 رویدادها")
+        self.events_btn.setToolTip("پنل رویدادهای مرتبط با دوربین انتخاب‌شده")
+        self.events_btn.clicked.connect(self._toggle_events_dock)
+        extras.addWidget(self.events_btn)
+        self.console_btn = QPushButton("🎛 کنسول")
+        self.console_btn.setToolTip(
+            "باز کردن کنسول کامل مدیریت دوربین برای دوربین انتخاب‌شده\n"
+            "(پخش بازبینی + همه‌ی ابزارها) — فقط برای کانال‌های NVR")
+        self.console_btn.clicked.connect(self._open_full_console)
+        extras.addWidget(self.console_btn)
+
+        # داک رویدادها (مخفی پیش‌فرض).
+        self.events_dock = QDockWidget("رویدادهای دوربین", self)
+        self.events_dock.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea |
+                                         Qt.DockWidgetArea.LeftDockWidgetArea)
+        dock_w = QWidget()
+        dock_layout = QVBoxLayout(dock_w)
+        dock_layout.addWidget(QLabel("رویدادهای مرتبط (دابل‌کلیک = باز کردن کنسول در آن لحظه):"))
+        self.event_list = QListWidget()
+        self.event_list.itemDoubleClicked.connect(self._on_event_double_clicked)
+        dock_layout.addWidget(self.event_list, 1)
+        self.events_dock.setWidget(dock_w)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.events_dock)
+        self.events_dock.hide()
+
         # F11: تمام‌صفحه؛ دابل‌کلیک روی هرجای پنجره هم همین کار را می‌کند.
         self._fs_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
         self._fs_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
         self._fs_shortcut.activated.connect(self.toggle_fullscreen)
         self.installEventFilter(self)
 
-    # ------------------------------------------------- نوار ابزار مدیریتی --
-    def _build_toolbar(self):
-        tb = QToolBar("مدیریت دوربین")
-        tb.setMovable(False)
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
-
-        self.draw_btn = QPushButton("✏ رسم محدوده")
-        self.draw_btn.setToolTip("رسم محدوده‌ی هشدار روی تصویر دوربین انتخاب‌شده")
-        self.draw_btn.setCheckable(True)
-        self.draw_btn.clicked.connect(self._on_draw_toggle)
-        tb.addWidget(self.draw_btn)
-
-        self.zones_btn = QPushButton("🗂 محدوده‌ها")
-        self.zones_btn.setToolTip("مدیریت محدوده‌های دوربین انتخاب‌شده (لیست/ویرایش/حذف)")
-        self.zones_btn.clicked.connect(lambda: self._toggle_dock(0))
-        tb.addWidget(self.zones_btn)
-
-        self.people_btn = QPushButton("👥 شمارش")
-        self.people_btn.setToolTip("فعال/غیرفعال کردن ردیابی و شمارش افراد برای دوربین انتخاب‌شده")
-        self.people_btn.setCheckable(True)
-        self.people_btn.clicked.connect(self._on_people_toggle)
-        tb.addWidget(self.people_btn)
-
-        self.audio_btn = QPushButton("🎧 صدا")
-        self.audio_btn.setToolTip("پخش/قطع صدای زنده‌ی دوربین انتخاب‌شده")
-        self.audio_btn.setCheckable(True)
-        self.audio_btn.clicked.connect(self._toggle_audio)
-        tb.addWidget(self.audio_btn)
-
-        tb.addWidget(QLabel("زوم:"))
-        zoom_out = QPushButton("−")
-        zoom_out.setFixedWidth(30)
-        zoom_out.clicked.connect(lambda: self._on_zoom_step(-1))
-        tb.addWidget(zoom_out)
-        zoom_in = QPushButton("+")
-        zoom_in.setFixedWidth(30)
-        zoom_in.clicked.connect(lambda: self._on_zoom_step(1))
-        tb.addWidget(zoom_in)
-
-        tb.addWidget(QLabel("چیدمان:"))
-        self.layout_combo = QComboBox()
-        self.layout_combo.addItem("خودکار", 0)
-        self.layout_combo.addItem("۱ دوربین", 1)
-        self.layout_combo.addItem("۴ دوربین", 4)
-        self.layout_combo.addItem("۹ دوربین", 9)
-        self.layout_combo.addItem("۱۶ دوربین", 16)
-        self.layout_combo.setToolTip("تعداد دوربین‌های نمایشی این پنجره")
-        self.layout_combo.currentIndexChanged.connect(self._on_display_count_changed)
-        tb.addWidget(self.layout_combo)
-
-        self.events_btn = QPushButton("📋 رویدادها")
-        self.events_btn.setToolTip("پنل رویدادهای مرتبط با دوربین انتخاب‌شده")
-        self.events_btn.clicked.connect(lambda: self._toggle_dock(1))
-        tb.addWidget(self.events_btn)
-
-        self.console_btn = QPushButton("🎛 کنسول")
-        self.console_btn.setToolTip(
-            "باز کردن کنسول کامل مدیریت دوربین برای دوربین انتخاب‌شده\n(پخش بازبینی + همه‌ی ابزارها) — فقط برای کانال‌های NVR")
-        self.console_btn.clicked.connect(self._open_full_console)
-        tb.addWidget(self.console_btn)
-
-    # ------------------------------------------------------------ داک --
-    def _build_dock(self):
-        self.dock = QDockWidget("پنل مدیریت", self)
-        self.dock.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea |
-                                  Qt.DockWidgetArea.LeftDockWidgetArea)
-        tabs = QTabWidget()
-        tabs.addTab(self._build_zones_tab(), "محدوده‌ها")
-        tabs.addTab(self._build_events_tab(), "رویدادها")
-        self.dock_tabs = tabs
-        self.dock.setWidget(tabs)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock)
-        self.dock.hide()
-
-    def _toggle_dock(self, tab_index):
-        try:
-            if self.dock.isVisible():
-                if self.dock_tabs.currentIndex() == tab_index:
-                    self.dock.hide()
-                    return
-            self.dock_tabs.setCurrentIndex(tab_index)
-            if tab_index == 0:
-                self._refresh_zone_list()
-            else:
-                self._refresh_events()
-            self.dock.show()
-        except Exception:
-            pass
-
-    def _build_zones_tab(self):
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        self.zone_list = QListWidget()
-        layout.addWidget(self.zone_list, 1)
-        row = QHBoxLayout()
-        edit_btn = QPushButton("ویرایش شکل")
-        edit_btn.clicked.connect(self._on_zone_edit)
-        row.addWidget(edit_btn)
-        del_btn = QPushButton("🗑 حذف")
-        del_btn.clicked.connect(self._on_zone_delete)
-        row.addWidget(del_btn)
-        layout.addLayout(row)
-        self.zone_edit_save_btn = QPushButton("💾 ذخیره‌ی ویرایش")
-        self.zone_edit_save_btn.clicked.connect(self._on_zone_edit_save)
-        self.zone_edit_save_btn.hide()
-        layout.addWidget(self.zone_edit_save_btn)
-        self.zone_edit_cancel_btn = QPushButton("↩ لغو")
-        self.zone_edit_cancel_btn.clicked.connect(self._on_zone_edit_cancel)
-        self.zone_edit_cancel_btn.hide()
-        layout.addWidget(self.zone_edit_cancel_btn)
-        return w
-
-    def _build_events_tab(self):
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.addWidget(QLabel("رویدادهای مرتبط (دابل‌کلیک = باز کردن کنسول در آن لحظه):"))
-        self.event_list = QListWidget()
-        self.event_list.itemDoubleClicked.connect(self._on_event_double_clicked)
-        layout.addWidget(self.event_list, 1)
-        return w
-
-    # -------------------------------------------------------------- تایل‌ها --
-    def _rebuild_tiles(self):
-        for t in self.tiles:
+    # ------------------------------------------------- همگام‌سازی شمارش --
+    def _on_wall_people_toggle_all(self, enabled):
+        """تاگل شمارش افراد دیوار نما -> اعمال روی دوربین‌های پنجره‌ی اصلی هم."""
+        if self._on_person_toggle is None:
+            return
+        for cid in self._cam_ids:
             try:
-                t.stop()
+                self._on_person_toggle(cid, bool(enabled))
             except Exception:
                 pass
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            wdg = item.widget()
-            if wdg is not None:
-                wdg.deleteLater()
-        self.tiles = []
-        self._selected_tile = None
-
-        cam_ids = self._cam_ids
-        if self._display_count > 0:
-            cam_ids = cam_ids[:self._display_count]
-        n = len(cam_ids)
-        cols = max(1, math.ceil(math.sqrt(n))) if n else 1
-        for i, cid in enumerate(cam_ids):
-            cam = self._cameras_by_id.get(cid)
-            if cam is None:
-                continue
-            try:
-                rtsp_url = self._build_rtsp_url(cam)
-            except Exception:
-                continue
-            tile = MonitorTileWidget(cam, rtsp_url, self._face_engine)
-            tile.selected.connect(self._select_tile)
-            self.tiles.append(tile)
-            self.grid.addWidget(tile, i // cols, i % cols)
-        if not self.tiles:
-            lbl = QLabel("دوربینی برای این پنجره انتخاب نشده است.")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.grid.addWidget(lbl, 0, 0)
-
-    def _on_display_count_changed(self, _idx):
-        try:
-            self._display_count = int(self.layout_combo.currentData() or 0)
-        except Exception:
-            self._display_count = 0
-        self._cancel_draw_mode()
-        self._stop_audio()
-        self._rebuild_tiles()
-        self._select_tile(self.tiles[0] if self.tiles else None)
-
-    def _select_tile(self, tile):
-        if tile is None or tile not in self.tiles:
-            return
-        self._cancel_draw_mode()
-        for t in self.tiles:
-            t.set_selected(t is tile)
-        self._selected_tile = tile
-        self._refresh_zone_list()
-        self._refresh_people_btn()
-        if self.dock.isVisible() and self.dock_tabs.currentIndex() == 1:
-            self._refresh_events()
 
     def _selected_cam(self):
-        t = self._selected_tile
-        return t.cam if t is not None else None
-
-    # ------------------------------------------------------------ رسم محدوده --
-    def _on_draw_toggle(self, checked):
-        tile = self._selected_tile
-        if tile is None or tile.cam is None:
-            self.draw_btn.setChecked(False)
-            return
-        self._drawing = bool(checked)
-        tile.video_label.set_draw_mode(bool(checked))
-        if checked:
-            tile.video_label.region_drawn.connect(self._on_region_drawn)
-
-    def _cancel_draw_mode(self):
-        if not self._drawing:
-            return
-        self._drawing = False
         try:
-            self.draw_btn.setChecked(False)
-        except Exception:
-            pass
-        for t in self.tiles:
-            try:
-                t.video_label.set_draw_mode(False)
-                t.video_label.region_drawn.disconnect(self._on_region_drawn)
-            except Exception:
-                pass
-
-    def _on_region_drawn(self, points):
-        tile = self._selected_tile
-        cam = self._selected_cam()
-        if tile is None or cam is None or not points or len(points) < 3:
-            return
-        regions = list(cam.get("regions") or [])
-        name, ok = QInputDialog.getText(
-            self, "نام محدوده", "نام این محدوده را وارد کنید:",
-            text=f"محدوده‌ی {len(regions) + 1}")
-        if not ok:
-            tile.video_label.set_pending_points_norm(None)
-            return
-        region = {
-            "id": str(uuid.uuid4()),
-            "number": len(regions) + 1,
-            "name": (name or "").strip() or f"محدوده‌ی {len(regions) + 1}",
-            "points": [tuple(p) for p in points],
-        }
-        regions.append(region)
-        self._save_regions(cam, regions)
-        tile.video_label.set_confirmed_regions(regions)
-        self._cancel_draw_mode()
-        self._refresh_zone_list()
-
-    def _save_regions(self, cam, regions):
-        try:
-            cam["regions"] = list(regions)
-            if self.camera_store is not None:
-                self.camera_store.update_camera(cam["id"], regions=list(regions))
-        except Exception:
-            pass
-
-    def _refresh_zone_list(self):
-        try:
-            self.zone_list.clear()
-        except Exception:
-            return
-        cam = self._selected_cam()
-        if cam is None:
-            return
-        for r in cam.get("regions") or []:
-            item = QListWidgetItem(f"{r.get('number', '?')} — {r.get('name', '')}")
-            item.setData(Qt.ItemDataRole.UserRole, r)
-            self.zone_list.addItem(item)
-
-    def _selected_region(self):
-        try:
-            item = self.zone_list.currentItem()
-            return item.data(Qt.ItemDataRole.UserRole) if item else None
+            slot = self.wall.selected_slot()
+            return slot.cam if slot is not None else None
         except Exception:
             return None
 
-    def _on_zone_delete(self):
-        cam = self._selected_cam()
-        region = self._selected_region()
-        if cam is None or region is None:
-            return
-        regions = [r for r in (cam.get("regions") or [])
-                   if r.get("id") != region.get("id")]
-        for i, r in enumerate(regions, 1):
-            r["number"] = i
-        self._save_regions(cam, regions)
-        tile = self._selected_tile
-        if tile is not None:
-            tile.video_label.set_confirmed_regions(regions)
-        self._refresh_zone_list()
-
-    def _on_zone_edit(self):
-        tile = self._selected_tile
-        region = self._selected_region()
-        if tile is None or region is None:
-            QMessageBox.information(self, "ویرایش", "اول یک محدوده را از لیست انتخاب کنید.")
-            return
-        self._cancel_draw_mode()
-        tile.video_label.set_pending_points_norm(region.get("points") or [],
-                                                 editing_existing=True)
-        self.zone_edit_save_btn.show()
-        self.zone_edit_cancel_btn.show()
-
-    def _on_zone_edit_save(self):
-        tile = self._selected_tile
-        cam = self._selected_cam()
-        region = self._selected_region()
-        if tile is None or cam is None or region is None:
-            return
-        pts = tile.video_label.pending_points_norm()
-        if not pts or len(pts) < 3:
-            QMessageBox.warning(self, "خطا", "شکل معتبر نیست (حداقل ۳ نقطه).")
-            return
-        for r in cam.get("regions") or []:
-            if r.get("id") == region.get("id"):
-                r["points"] = [tuple(p) for p in pts]
-                break
-        self._save_regions(cam, list(cam.get("regions") or []))
-        tile.video_label.set_pending_points_norm(None)
-        tile.video_label.set_confirmed_regions(cam.get("regions") or [])
-        self.zone_edit_save_btn.hide()
-        self.zone_edit_cancel_btn.hide()
-        self._refresh_zone_list()
-
-    def _on_zone_edit_cancel(self):
-        tile = self._selected_tile
-        if tile is not None:
-            tile.video_label.set_pending_points_norm(None)
-        self.zone_edit_save_btn.hide()
-        self.zone_edit_cancel_btn.hide()
-
-    # ---------------------------------------------------------- شمارش افراد --
-    def _refresh_people_btn(self):
-        cam = self._selected_cam()
+    # ------------------------------------------------------------ رویدادها --
+    def _toggle_events_dock(self):
         try:
-            self.people_btn.blockSignals(True)
-            self.people_btn.setChecked(bool((cam or {}).get("person_tracking")))
-            self.people_btn.setEnabled(cam is not None)
-        except Exception:
-            pass
-        finally:
-            try:
-                self.people_btn.blockSignals(False)
-            except Exception:
-                pass
-
-    def _on_people_toggle(self, checked):
-        cam = self._selected_cam()
-        tile = self._selected_tile
-        if cam is None:
-            self.people_btn.setChecked(not checked)
-            return
-        try:
-            cam["person_tracking"] = bool(checked)
-            if self.camera_store is not None:
-                self.camera_store.update_camera(cam["id"], person_tracking=bool(checked))
-            if tile is not None and tile.stream_thread is not None:
-                tile.stream_thread.set_person_tracking(bool(checked))
-            if self._on_person_toggle is not None:
-                try:
-                    self._on_person_toggle(cam["id"], bool(checked))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------ صدا --
-    def _toggle_audio(self):
-        if self._listen_session is not None:
-            self._stop_audio()
-            return
-        cam = self._selected_cam()
-        if not cam:
-            self.audio_btn.setChecked(False)
-            return
-        try:
-            from camera_audio import ListenSession
-            session = ListenSession()
-            if session.start(dict(cam)):
-                self._listen_session = session
-                self.audio_btn.setText("🔊 وصل است")
+            if self.events_dock.isVisible():
+                self.events_dock.hide()
             else:
-                self.audio_btn.setChecked(False)
-        except Exception:
-            self.audio_btn.setChecked(False)
-
-    def _stop_audio(self):
-        try:
-            if self._listen_session is not None:
-                try:
-                    self._listen_session.stop()
-                except Exception:
-                    pass
-                self._listen_session = None
-        except Exception:
-            pass
-        try:
-            self.audio_btn.setChecked(False)
-            self.audio_btn.setText("🎧 صدا")
+                self._refresh_events()
+                self.events_dock.show()
         except Exception:
             pass
 
-    # ------------------------------------------------------------------ زوم --
-    def _on_zoom_step(self, direction):
-        tile = self._selected_tile
-        if tile is not None:
-            tile.zoom_step(direction)
-
-    # --------------------------------------------------------------- رویدادها --
     def _refresh_events(self):
         try:
             self.event_list.clear()
@@ -724,35 +231,6 @@ class MonitorWindow(QMainWindow):
                 self.event_list.addItem(item)
             except Exception:
                 continue
-
-    def _open_full_console(self):
-        """دکمه‌ی «کنسول کامل»: باز کردن NVRConsoleDialog برای دوربین
-        انتخاب‌شده در لبه‌ی زنده (۴۰ ثانیه‌ی اخیر) — فقط کانال‌های NVR."""
-        cam = self._selected_cam()
-        nvr_id = (cam or {}).get("nvr_id")
-        channel = (cam or {}).get("channel")
-        if not nvr_id or channel is None or self.camera_store is None:
-            QMessageBox.information(
-                self, "کنسول",
-                "کنسول کامل فقط برای کانال‌های NVR است؛ این دوربین مستقل است.")
-            return
-        try:
-            nvr = self.camera_store.get_nvr(nvr_id)
-        except Exception:
-            nvr = None
-        if not nvr:
-            return
-        try:
-            from nvr_console_dialog import NVRConsoleDialog
-            now = datetime.now()
-            dlg = NVRConsoleDialog(
-                nvr, channel, now - timedelta(seconds=40), now,
-                camera_label=(cam or {}).get("name", ""), parent=self,
-                camera_store=self.camera_store, report_store=self.report_store,
-                on_person_toggle=self._on_person_toggle)
-            dlg.exec()
-        except Exception as e:
-            QMessageBox.warning(self, "خطا", f"باز کردن کنسول ممکن نشد:\n{e}")
 
     def _on_event_double_clicked(self, item):
         """دابل‌کلیک روی رویداد = باز کردن کنسول مدیریت دوربین در آن لحظه
@@ -790,6 +268,36 @@ class MonitorWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "خطا", f"باز کردن کنسول ممکن نشد:\n{e}")
 
+    def _open_full_console(self):
+        """دکمه‌ی «کنسول کامل»: باز کردن NVRConsoleDialog برای دوربین
+        انتخاب‌شده در لبه‌ی زنده (۴۰ ثانیه‌ی اخیر) — فقط کانال‌های NVR."""
+        cam = self._selected_cam()
+        nvr_id = (cam or {}).get("nvr_id")
+        channel = (cam or {}).get("channel")
+        if not nvr_id or channel is None or self.camera_store is None:
+            QMessageBox.information(
+                self, "کنسول",
+                "کنسول کامل فقط برای کانال‌های NVR است؛ این دوربین مستقل است.")
+            return
+        try:
+            nvr = self.camera_store.get_nvr(nvr_id)
+        except Exception:
+            nvr = None
+        if not nvr:
+            return
+        try:
+            from nvr_console_dialog import NVRConsoleDialog
+            now = datetime.now()
+            dlg = NVRConsoleDialog(
+                nvr, channel, now - timedelta(seconds=40), now,
+                camera_label=(cam or {}).get("name", ""), parent=self,
+                camera_store=self.camera_store, report_store=self.report_store,
+                on_person_toggle=self._on_person_toggle)
+            dlg.exec()
+        except Exception as e:
+            QMessageBox.warning(self, "خطا", f"باز کردن کنسول ممکن نشد:\n{e}")
+
+    # ------------------------------------------------- پنجره (مثل قبل) --
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.MouseButtonDblClick:
             self.toggle_fullscreen()
@@ -835,21 +343,16 @@ class MonitorWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
-            self._cancel_draw_mode()
+            self.wall.camera_grid.stop_all()
         except Exception:
             pass
-        self._stop_audio()
-        for tile in self.tiles:
-            try:
-                tile.stop()
-            except Exception:
-                pass
         try:
             if self._on_closed is not None:
                 self._on_closed(self)
         except Exception:
             pass
         super().closeEvent(event)
+
 
 
 class MonitorRoomDialog(QDialog):
@@ -1033,6 +536,14 @@ class MonitorRoomManager:
     def _on_window_closed(self, win):
         self.windows = [e for e in self.windows if e["window"] is not win]
 
+    def _open_setup_for_window(self):
+        """کال‌بک دکمه‌ی «🖥 اتاق مانیتورینگ» داخل پنجره‌های نما."""
+        try:
+            parent = self.windows[-1]["window"] if self.windows else None
+            self.open_setup_dialog(parent)
+        except Exception:
+            pass
+
     def open_window(self, cam_ids, geometry=None, fullscreen=False):
         """باز کردن یک پنجره‌ی جدید (movable/resizable) با دوربین‌های داده‌شده."""
         cameras_by_id = {c.get("id"): c for c in self.camera_store.get_cameras()}
@@ -1044,7 +555,8 @@ class MonitorRoomManager:
             self.camera_store.build_rtsp_url, self.face_engine,
             on_closed=self._on_window_closed,
             camera_store=self.camera_store, report_store=self.report_store,
-            on_person_toggle=self._on_person_toggle)
+            on_person_toggle=self._on_person_toggle,
+            on_open_monitor_room=self._open_setup_for_window)
         if geometry is None:
             # آبشاری روی صفحه‌ی اصلی تا پنجره‌ها روی هم نیفتند
             try:
