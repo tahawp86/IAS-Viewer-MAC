@@ -32,9 +32,9 @@ DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PASS = "A12345678a"
 
 # کاربر تست پیش‌فرض (درخواست طه، 2026-09-29) — فقط صفحه‌ی اصلی و تنظیمات.
-DEFAULT_TEST_USER = "Test"
-DEFAULT_TEST_PASS = "123456"
-TEST_USER_PAGES = ("home", "settings")
+DEFAULT_TEST_USER = "User"
+DEFAULT_USER_PASS = "123456"
+USER_PAGES = ("home", "settings")
 
 _PBKDF2_ITERATIONS = 200_000
 _SALT_BYTES = 16
@@ -144,24 +144,31 @@ class UserManager:
         self.save()
         return True
 
-    def ensure_test_user(self):
-        """اطمینان از وجود کاربر Test با دسترسی فقط به صفحه‌ی اصلی و تنظیمات.
+    def ensure_default_user(self):
+        """اطمینان از وجود کاربر User با دسترسی فقط به صفحه‌ی اصلی و تنظیمات.
 
         اگر کاربر وجود نداشت با رمز پیش‌فرض (123456) ساخته می‌شود؛ اگر وجود
         داشت رمزش دست نمی‌خورد ولی سطح دسترسی‌اش همیشه به home+settings
         محدود می‌ماند (is_admin هم False می‌شود).
         """
-        rec = self.users.get(DEFAULT_TEST_USER)
+        # (1.2.0) مایگریشن: کاربر قدیمی "Test" به "User" تغییر نام می‌دهد.
         changed = False
+        if "Test" in self.users:
+            if DEFAULT_TEST_USER not in self.users:
+                self.users[DEFAULT_TEST_USER] = self.users.pop("Test")
+            else:
+                del self.users["Test"]
+            changed = True
+        rec = self.users.get(DEFAULT_TEST_USER)
         if rec is None:
             rec = _blank_user(DEFAULT_TEST_USER, is_admin=False)
-            salt, h = hash_password(DEFAULT_TEST_PASS)
+            salt, h = hash_password(DEFAULT_USER_PASS)
             rec["salt"] = salt
             rec["pass_hash"] = h
             rec["must_change_password"] = False
             self.users[DEFAULT_TEST_USER] = rec
             changed = True
-        want_perms = {k: (k in TEST_USER_PAGES) for k in PAGE_KEYS}
+        want_perms = {k: (k in USER_PAGES) for k in PAGE_KEYS}
         if rec.get("permissions") != want_perms:
             rec["permissions"] = want_perms
             changed = True

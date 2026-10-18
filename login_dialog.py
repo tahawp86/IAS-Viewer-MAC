@@ -163,7 +163,7 @@ def run_login(parent=None):
     """اجرای کامل گردش ورود. خروجی: رکورد کاربر یا None (انصراف)."""
     mgr = UserManager()
     mgr.ensure_default_admin()
-    mgr.ensure_test_user()
+    mgr.ensure_default_user()
     dlg = LoginDialog(mgr, parent=parent)
     if dlg.exec() == QDialog.DialogCode.Accepted and dlg.user:
         return dlg.user
