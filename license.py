@@ -443,16 +443,25 @@ def license_feature_enabled(key: str, state=None) -> bool:
 
 
 def license_feature_limit(key: str, state=None) -> int:
-    """سقف تعداد دوربین یک قابلیت از خود لایسنس؛ ۰ = نامحدود.
+    """سقف مؤثر تعداد دوربین یک قابلیت؛ ۰ = نامحدود.
 
-    سقف مؤثر هنگام مصرف = کمینه‌ی این عدد و سقف cameras (قرارداد
-    اسکیما)؛ در عمل مصرف هیچ قابلیتی از تعداد کل دوربین‌ها بیشتر
-    نمی‌شود و سقف کل هنگام افزودن دوربین اعمال می‌شود."""
+    (حکم IVDagent در بازبینی فاز ۲ — عین همین قاعده در ویندوز هم اعمال
+    می‌شود تا دو پلتفرم یکی بمانند.) «سقف مؤثر» نسبت به سقف کل دوربین‌ها
+    سنجیده می‌شود: وقتی cameras سقف دارد (>۰)، سقف مؤثر هر قابلیت =
+    کمینه‌ی سقف خودش و cameras؛ و count صفر (نامحدود) در این حالت یعنی
+    همان سقف cameras. خود quotas در state دست‌نخورده و وفادار به فایل
+    می‌مانند؛ این تابع تنها نقطه‌ی مصرف سقف مؤثر است."""
     try:
         st = state or load_license()
         if not st.valid:
             return 0
-        return int(st.quotas.get(key, 0))
+        raw = int(st.quotas.get(key, 0))
+        if key == "cameras" or key not in FEATURE_KEYS:
+            return raw
+        cam = int(st.quotas.get("cameras", 0))
+        if cam > 0:
+            return cam if raw == 0 else min(raw, cam)
+        return raw
     except Exception:
         return 0
 
