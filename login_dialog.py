@@ -203,6 +203,20 @@ class LoginDialog(QDialog):
         username = self.user_edit.text().strip()
         password = self.pass_edit.text()
         user = self.manager.verify(username, password)
+        if user is not None:
+            # قاعده‌ی امنیتی IVDagent: وقتی لایسنس معتبر حساب کاربر
+            # (app_user) دارد، ورود کاربر محلی پیش‌فرض «User» (با رمز
+            # کارخانه‌ایِ شناخته‌شده) غیرفعال می‌شود تا دور زدن حساب
+            # لایسنسی با آن ممکن نباشد. ادمین محلی مستقل می‌ماند.
+            try:
+                if not user.get("is_admin") and \
+                        username == user_manager.DEFAULT_TEST_USER:
+                    from license import load_license, license_app_user_state
+                    st = load_license()
+                    if st.valid and license_app_user_state(st) == "valid":
+                        user = None  # ادامه با مسیر لایسنسی پایین
+            except Exception:
+                pass
         if not user:
             # مسیر دوم: حساب کاربر داخل فایل لایسنس (app_user) — فقط وقتی
             # لایسنس معتبر و app_user سالم باشد؛ در غیر این صورت fail-closed.
