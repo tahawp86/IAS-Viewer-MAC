@@ -301,11 +301,14 @@ def check_payload_validity(payload: dict):
 class LicenseState:
     def __init__(self, valid=False, customer="", issued="", expires="",
                  quotas=None, hwid=None, features=None, quota_enabled=None,
-                 feature_config=None, error="", path=""):
+                 feature_config=None, payload=None, error="", path=""):
         self.valid = valid
         self.customer = customer
         self.issued = issued
         self.expires = expires
+        # payload تأییدشده‌ی کامل (برای app_user و بررسی‌های بعدی)؛ فقط وقتی
+        # امضا و اعتبار معتبر بوده پر می‌شود.
+        self.payload = payload
         self.quotas = quotas or dict(DEMO_QUOTAS)
         self.hwid = hwid
         # دیفالت «فعال» برای سازگاری با لایسنس‌های قدیمی بدون فیلد features؛
@@ -385,6 +388,7 @@ def load_license(path=None) -> LicenseState:
         features=features,
         quota_enabled=quota_enabled,
         feature_config=fc,
+        payload=payload,
         path=p,
     )
 
@@ -451,6 +455,165 @@ def license_feature_limit(key: str, state=None) -> int:
         return int(st.quotas.get(key, 0))
     except Exception:
         return 0
+
+
+# ----------------------------------------------------------------------------
+# حساب کاربر برنامه (app_user) — فیلد اختیاری داخل payload (زیر همان امضا)
+# (هم‌رفتار با license_common.py در ریپوی IAS-LicenseManager — سند مرجع:
+# docs/LICENSE_SCHEMA.md بخش ۳-ب؛ هر تغییری باید در هر دو جا هم‌زمان اعمال شود.)
+# ----------------------------------------------------------------------------
+# ورود کاربر برنامه با نام کاربری/رمز داخل خودِ فایل لایسنس انجام می‌شود.
+# رمز هرگز plaintext ذخیره نمی‌شود: فقط هش PBKDF2-HMAC-SHA256 با salt تصادفی
+# یکتا نگه داشته می‌شود (همان پریمیتیو user_manager برنامه‌ها؛ پارامترها از
+# خود فایل خوانده می‌شوند تا صدورهای آینده بدون تغییر اسکیما قوی‌تر شوند).
+APP_USER_ALGO = "pbkdf2-sha256"
+APP_USER_ITERATIONS = 600_000      # صدورهای جدید — توصیه‌ی فعلی OWASP
+APP_USER_SALT_BYTES = 16
+APP_USER_DKLEN = 32
+APP_USER_MIN_ITERATIONS = 100_000  # کف امنیتی خواننده — کمتر از این = بدفرم
+
+
+def hash_app_user_password(password: str) -> dict:
+    """ساخت بخش رمز app_user از رمز خام — فقط لحظه‌ی صدور؛ رمز خام هیچ‌جا
+    ذخیره یا لاگ نمی‌شود و بعد از این فراخوانی دیگر لازم نیست نگهش داشت."""
+    import hashlib
+    salt = os.urandom(APP_USER_SALT_BYTES)
+    dk = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"),
+                             salt, APP_USER_ITERATIONS, APP_USER_DKLEN)
+    return {
+        "password_algo": APP_USER_ALGO,
+        "password_iterations": APP_USER_ITERATIONS,
+        "password_salt": salt.hex(),
+        "password_hash": dk.hex(),
+    }
+
+
+def build_app_user(username: str, password: str) -> dict:
+    """ساخت app_user کامل برای payload از نام کاربری و رمز خام."""
+    username = (username or "").strip()
+    if not username:
+        raise ValueError("نام کاربری حساب نمی‌تواند خالی باشد.")
+    if not password:
+        raise ValueError("رمز حساب نمی‌تواند خالی باشد.")
+    au = {"username": username}
+    au.update(hash_app_user_password(password))
+    return au
+
+
+def _app_user_valid(au) -> bool:
+    """اعتبارسنجی ساختاری app_user (بدون دانستن رمز)."""
+    if not isinstance(au, dict):
+        return False
+    if not isinstance(au.get("username"), str) or not au["username"].strip():
+        return False
+    if au.get("password_algo") != APP_USER_ALGO:
+        return False
+    it = au.get("password_iterations")
+    if not isinstance(it, int) or it < APP_USER_MIN_ITERATIONS:
+        return False
+    try:
+        salt = bytes.fromhex(au.get("password_salt") or "")
+        dk = bytes.fromhex(au.get("password_hash") or "")
+    except (TypeError, ValueError):
+        return False
+    return len(salt) >= APP_USER_SALT_BYTES and len(dk) >= 16
+
+
+def app_user_state(payload: dict) -> str:
+    """وضعیت app_user در payload: ‏"absent" | "valid" | "malformed".
+
+    - absent: فیلد نیست — لایسنس حسابی تحمیل نمی‌کند (رفتار قبلی ورود).
+    - valid: ساختار درست است و می‌شود باهاش ورود را راستی‌آزمایی کرد.
+    - malformed: فیلد هست ولی بدفرم است — ورود لایسنسی باید fail-closed
+      شود (هرگز به رمز پیش‌فرض یا رفتار «بدون حساب» برنگردد)؛ بقیه‌ی
+      لایسنس (feature_config و...) سر جایش معتبر می‌ماند.
+    """
+    if not isinstance(payload, dict) or payload.get("app_user") is None:
+        return "absent"
+    return "valid" if _app_user_valid(payload["app_user"]) else "malformed"
+
+
+def get_app_user(payload: dict) -> dict | None:
+    """app_user معتبر payload یا None (غایب/بدفرم — تفکیک با app_user_state)."""
+    if app_user_state(payload) != "valid":
+        return None
+    return payload["app_user"]
+
+
+def verify_app_user(payload: dict, username: str, password: str) -> bool:
+    """راستی‌آزمایی نام کاربری/رمز در برابر app_user لایسنس.
+
+    پارامترهای هش (salt/تکرار) از خود فایل خوانده می‌شوند و مقایسه‌ی نهایی
+    constant-time است. برای app_user غایب یا بدفرم همیشه False برمی‌گردد.
+    """
+    import hashlib
+    import hmac
+    au = get_app_user(payload)
+    if au is None:
+        return False
+    if (username or "").strip() != au["username"]:
+        return False
+    salt = bytes.fromhex(au["password_salt"])
+    expected = bytes.fromhex(au["password_hash"])
+    dk = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"),
+                             salt, au["password_iterations"], len(expected))
+    return hmac.compare_digest(dk, expected)
+
+
+# ----------------------------------------------------------------------------
+# پل بین LicenseState و app_user — برای دیالوگ ورود
+# ----------------------------------------------------------------------------
+def license_app_user_state(state=None) -> str:
+    """وضعیت app_user لایسنس بارگذاری‌شده: "absent"|"valid"|"malformed".
+
+    بدون لایسنس معتبر "absent" است (مسیر ورود لایسنسی غیرفعال)."""
+    try:
+        st = state or load_license()
+        if not st.valid:
+            return "absent"
+        return app_user_state(st.payload or {})
+    except Exception:
+        return "absent"
+
+
+def verify_license_user(username: str, password: str, state=None) -> bool:
+    """راستی‌آزمایی ورود با حساب داخل فایل لایسنس (فقط لایسنس معتبر)."""
+    try:
+        st = state or load_license()
+        if not st.valid:
+            return False
+        return verify_app_user(st.payload or {}, username, password)
+    except Exception:
+        return False
+
+
+def license_session_user(state=None):
+    """رکورد نشست (هم‌شکل رکوردهای user_manager) برای کاربر app_user.
+
+    دسترسی صفحه‌ای رکورد «همه» است؛ باز و بسته بودن واقعی صفحه‌ها را
+    گیت لایسنس (PAGE_FEATURE_MAP در main.py) تعیین می‌کند. None یعنی
+    لایسنس معتبر با app_user معتبر نداریم.
+    """
+    try:
+        st = state or load_license()
+        if not st.valid:
+            return None
+        au = get_app_user(st.payload or {})
+        if not au:
+            return None
+        return {
+            "username": au["username"],
+            "salt": "",
+            "pass_hash": "",
+            "is_admin": False,
+            "must_change_password": False,
+            "permissions": {k: True for k in
+                            ("home", "fire", "face", "reports", "plate",
+                             "person", "map", "settings")},
+            "via_license": True,
+        }
+    except Exception:
+        return None
 
 
 def is_quota_enabled(name: str, state=None) -> bool:
