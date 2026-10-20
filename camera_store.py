@@ -305,7 +305,7 @@ class CameraStore:
     # --------------------------------------------------------------- nvrs --
 
     def add_nvr(self, name, ip, rtsp_port, onvif_port, user, pwd, brand="",
-                camera_brand="", playback_template="", group=""):
+                camera_brand="", playback_template="", group="", use_https=False):
         nvr = {
             "id": str(uuid.uuid4()),
             "name": name or ip,
@@ -315,6 +315,8 @@ class CameraStore:
             "user": user,
             "pass": pwd,
             "brand": brand,
+            # (1.2.0) پنل وب با HTTPS (فالبک «باز کردن وب NVR»).
+            "use_https": bool(use_https),
             # (2.0.61-beta) گروه‌بندی: مثل دوربین‌ها، NVR هم می‌تواند عضو
             # یک گروه نمایشی باشد؛ خالی یعنی بدون گروه.
             "group": group or "",

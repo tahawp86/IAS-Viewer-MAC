@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 
 from report_store import EVENT_TYPE_LABELS_FA
 from plate_store import plate_store
-from nvr_playback_dialog import NVRPlaybackDialog
+from nvr_console_dialog import NVRConsoleDialog
 
 # چند ثانیه قبل/بعد از لحظه‌ی ثبت‌شده‌ی هر رویداد که برای پخش بازبینی از NVR
 # درخواست می‌شود - چون ساعت رویداد دقیقاً لحظه‌ی تشخیص در برنامه است، نه
@@ -368,7 +368,8 @@ class ReportsPage(QWidget):
             # هیچ NVR ای برای این دوربین پیدا نشود، با کلیک روی دکمه پیام
             # روشن نمایش داده می‌شود (نه اینکه از همان اول دکمه پنهان بماند).
             if self.camera_store is not None:
-                play_btn = QPushButton("▶ پخش از NVR")
+                # (1.2.0) دکمه‌ی «گزارش ویدیویی» کنار هر ردیف گزارش/آلارم.
+                play_btn = QPushButton("🎬 گزارش ویدیویی")
                 play_btn.clicked.connect(
                     lambda _checked=False, _ts=ts, _nvr_id=nvr_id, _ch=channel, _cam=camera:
                     self._open_nvr_playback(_ts, _nvr_id, _ch, _cam)
@@ -412,7 +413,9 @@ class ReportsPage(QWidget):
             return
         start_dt = event_dt - PLAYBACK_MARGIN_BEFORE
         end_dt = event_dt + PLAYBACK_MARGIN_AFTER
-        dialog = NVRPlaybackDialog(nvr, channel, start_dt, end_dt, camera_label=camera_name, parent=self)
+        dialog = NVRConsoleDialog(
+            nvr, channel, start_dt, end_dt, camera_label=camera_name, parent=self,
+            camera_store=self.camera_store, report_store=self.report_store)
         dialog.exec()
 
     def export_csv(self):

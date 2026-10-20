@@ -35,6 +35,9 @@ class AddNVRDialog(QDialog):
         self.user_input = QLineEdit("admin")
         self.pass_input = QLineEdit()
         self.pass_input.setEchoMode(QLineEdit.EchoMode.Password)
+        # (1.2.0) برای NVRهایی که پنل وب‌شان فقط روی HTTPS است (فالبک
+        # «باز کردن وب NVR» در گزارش ویدیویی از همین استفاده می‌کند).
+        self.https_check = QCheckBox("پنل وب با HTTPS (به‌جای HTTP)")
 
         self.brand_combo = QComboBox()
         for key, label in BRAND_LABELS.items():
@@ -60,6 +63,7 @@ class AddNVRDialog(QDialog):
         form.addRow("پورت ONVIF (اختیاری):", self.onvif_port_input)
         form.addRow("نام کاربری:", self.user_input)
         form.addRow("رمز عبور:", self.pass_input)
+        form.addRow("پنل وب:", self.https_check)
         form.addRow("برند NVR:", self.brand_combo)
         form.addRow("برند دوربین‌های متصل:", self.camera_brand_combo)
         # (2.0.61-beta) گروه‌بندی — کامبوی قابل‌ویرایش با گروه‌های موجود
@@ -426,6 +430,7 @@ class AddNVRDialog(QDialog):
             "brand": self.brand_combo.currentData(),
             "camera_brand": self.camera_brand_combo.currentData(),
             "group": _group,
+            "use_https": bool(self.https_check.isChecked()),
         }
 
     def get_selected_channels(self):

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""monitor_room.py — اتاق مانیتورینگ (multi-monitor) نسخه‌ی مک (1.1.1).
+"""monitor_room.py — اتاق مانیتورینگ (multi-monitor) نسخه‌ی مک (1.2.0).
 
 قابلیت «اتاق مانیتورینگ»: تقسیم تصاویر دوربین‌ها روی چند مانیتور متصل به سیستم.
 - شناسایی مانیتورها با QApplication.screens() (نمایشی، برای راهنمایی کاربر)
@@ -10,30 +10,28 @@
   هر پنجره)؛ بعد از بستن و باز کردن برنامه، چیدمان بازیابی می‌شود.
   (چیدمان قدیمی نسخه‌ی 1.1.0 به‌صورت خودکار مهاجرت می‌کند.)
 
-نکته‌ی طراحی: تایل‌های این پنجره‌ها فقط «نمایش» می‌دهند — هر تایل استریم
-مستقیم خودش را باز می‌کند (CameraStreamThread) ولی هیچ callback رویدادی
-(چهره/پلاک/حریق/شخص) وصل نمی‌شود تا رویدادها تکراری ثبت نشوند.
+(1.2.0) بازطراحی از نو به دستور طه: پنجره‌های «نما» کپی کامل صفحه‌ی اصلی‌اند —
+از CameraPageWidget مشترک (camera_page.py) استفاده می‌کنند؛ همان ظاهر، چیدمان
+و همه‌ی دکمه‌ها (single source of truth). کال‌بک‌های رویداد None هستند تا
+رویدادها تکراری ثبت نشوند.
 """
 
 import json
-import math
 import os
-import time
+from datetime import datetime, timedelta
 
-import cv2
-from PyQt6.QtCore import Qt, QEvent, QPoint
-from PyQt6.QtGui import QImage, QPixmap, QKeySequence, QShortcut
+from PyQt6.QtCore import Qt, QEvent, QPoint, QTimer
+from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QGridLayout, QGroupBox, QHBoxLayout,
+    QApplication, QDialog, QGroupBox, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QVBoxLayout, QWidget, QToolBar,
 )
 
 from app_paths import get_data_dir
-from camera_stream import CameraStreamThread
+from main_page import MainPageWidget
 
 LAYOUT_FILENAME = "monitor_layout.json"
-_DISPLAY_FPS = 15.0
 
 
 def _bgr_to_pixmap(frame):
@@ -103,140 +101,173 @@ class MonitorLayoutStore:
             return False
 
 
-class MonitorTileWidget(QWidget):
-    """تایل نمایشی سبک اتاق مانیتورینگ: فقط تصویر زنده + وضعیت اتصال."""
-
-    def __init__(self, cam: dict, rtsp_url: str, face_engine, parent=None):
-        super().__init__(parent)
-        self.cam = cam
-        self._last_display_ts = 0.0
-        self.stream_thread = None
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(2, 2, 2, 2)
-        lay.setSpacing(2)
-
-        header = QHBoxLayout()
-        self.name_label = QLabel(cam.get("name") or cam.get("ip", ""))
-        self.name_label.setStyleSheet("font-weight: bold; font-size: 12px;")
-        self.status_label = QLabel("در حال اتصال...")
-        self.status_label.setStyleSheet("color: #aaa; font-size: 11px;")
-        header.addWidget(self.name_label)
-        header.addStretch()
-        header.addWidget(self.status_label)
-        lay.addLayout(header)
-
-        self.video_label = QLabel("در انتظار تصویر...")
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setStyleSheet("background: #000; color: #888;")
-        self.video_label.setMinimumSize(160, 120)
-        lay.addWidget(self.video_label, 1)
-
-        # مثل تایل‌های اصلی: هر تایل استریم خودش را دارد؛ فقط callbackهای
-        # رویداد (چهره/پلاک/حریق/شخص) وصل نمی‌شود — نمایش صرف.
-        self.stream_thread = CameraStreamThread(rtsp_url, face_engine)
-        self.stream_thread.frame_ready.connect(self._on_frame_ready)
-        self.stream_thread.error_signal.connect(self._on_error)
-        self.stream_thread.connected_signal.connect(self._on_connected)
-        self.stream_thread.stream_status_signal.connect(self._on_stream_status)
-        self.stream_thread.start()
-
-    def _on_frame_ready(self, display_frame, raw_frame):
-        # محدودیت نرخ نمایش (~۱۵ فریم‌برثانیه) مثل تایل اصلی.
-        now = time.monotonic()
-        if now - self._last_display_ts < 1.0 / _DISPLAY_FPS:
-            return
-        self._last_display_ts = now
-        frame = display_frame
-        try:
-            lw, lh = self.video_label.width(), self.video_label.height()
-        except Exception:
-            lw, lh = 0, 0
-        if lw > 0 and lh > 0:
-            h, w = frame.shape[:2]
-            scale = min(lw / w, lh / h)
-            if scale < 1.0:
-                frame = cv2.resize(
-                    frame, (max(1, int(w * scale)), max(1, int(h * scale))),
-                    interpolation=cv2.INTER_LINEAR)
-        pixmap = _bgr_to_pixmap(frame)
-        if pixmap is not None:
-            self.video_label.setPixmap(pixmap)
-
-    def _on_error(self, msg):
-        self.status_label.setText(f"خطا: {(msg or '')[:60]}")
-        self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
-
-    def _on_connected(self):
-        self.status_label.setText("متصل")
-        self.status_label.setStyleSheet("color: #2ecc71; font-size: 11px;")
-
-    def _on_stream_status(self, info):
-        try:
-            state = (info or {}).get("state", "")
-        except Exception:
-            state = ""
-        mapping = {
-            "connected": ("متصل", "#2ecc71"),
-            "reconnecting": ("در حال تلاش مجدد...", "#f39c12"),
-            "weak": ("سیگنال ضعیف", "#f39c12"),
-            "down": ("قطع", "#e74c3c"),
-        }
-        if state in mapping:
-            text, color = mapping[state]
-            self.status_label.setText(text)
-            self.status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
-
-    def stop(self):
-        th, self.stream_thread = self.stream_thread, None
-        if th is not None:
-            try:
-                th.stop()
-            except Exception:
-                pass
-
-
 class MonitorWindow(QMainWindow):
-    """پنجره‌ی نمایش مستقل اتاق مانیتورینگ — کاملاً movable و resizable.
+    """پنجره‌ی نمایش مستقل اتاق مانیتورینگ — کپی کامل صفحه‌ی اصلی.
 
-    کاربر با موس می‌گیرد و روی هر مانیتوری می‌اندازد؛ F11 یا دابل‌کلیک:
-    تمام‌صفحه.
+    (1.2.0) بازطراحی به دستور طه: کل لایه‌ی صفحه‌ی اصلی (چپ + وسط + راست)
+    از MainPageWidget مشترک (main_page.py) ساخته می‌شود — همان ظاهر، چیدمان
+    و همه‌ی دکمه‌ها و قابلیت‌ها (single source of truth). داده‌ها مشترک‌اند
+    (همان camera_store و report_store).
+    کال‌بک‌های رویداد None هستند تا رویدادها تکراری ثبت نشوند؛ پنل رویدادها
+    از report_store مشترک خوانده می‌شود.
+    افزونه‌ی مخصوص نما: دکمه‌ی «🎛 کنسول» برای باز کردن کنسول کامل دوربین.
+
+    کاملاً movable و resizable؛ F11 یا دابل‌کلیک: تمام‌صفحه.
     """
 
     def __init__(self, title, cam_ids, cameras_by_id, build_rtsp_url,
-                 face_engine, on_closed=None, parent=None):
+                 face_engine, on_closed=None, parent=None,
+                 camera_store=None, report_store=None, on_person_toggle=None,
+                 on_open_monitor_room=None, alarm_player=None, building_fire=None,
+                 on_building_fire_log=None):
         super().__init__(parent)
-        self.tiles = []
         self._on_closed = on_closed
+        self.camera_store = camera_store
+        self.report_store = report_store
+        self._on_person_toggle = on_person_toggle
+        self._cam_ids = [cid for cid in (cam_ids or [])
+                         if cid in (cameras_by_id or {})]
         self.setWindowTitle(title)
-        central = QWidget()
-        self.setCentralWidget(central)
-        grid = QGridLayout(central)
-        grid.setContentsMargins(6, 6, 6, 6)
-        grid.setSpacing(6)
-        n = len(cam_ids)
-        cols = max(1, math.ceil(math.sqrt(n))) if n else 1
-        for i, cid in enumerate(cam_ids):
-            cam = cameras_by_id.get(cid)
-            if cam is None:
-                continue
-            try:
-                rtsp_url = build_rtsp_url(cam)
-            except Exception:
-                continue
-            tile = MonitorTileWidget(cam, rtsp_url, face_engine)
-            self.tiles.append(tile)
-            grid.addWidget(tile, i // cols, i % cols)
-        if not self.tiles:
-            lbl = QLabel("دوربینی برای این پنجره انتخاب نشده است.")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            grid.addWidget(lbl, 0, 0)
+
+        # کل صفحه‌ی اصلی — همان کامپوننت‌های مشترک.
+        self.page = MainPageWidget(
+            face_engine, camera_store,
+            on_open_monitor_room=on_open_monitor_room,
+            on_people_toggle_all=self._on_wall_people_toggle_all,
+            alarm_player=alarm_player, building_fire=building_fire,
+            on_building_fire_log=on_building_fire_log,
+            report_store=report_store,
+            parent=self,
+        )
+        self.setCentralWidget(self.page)
+        cams = [(cameras_by_id or {})[cid] for cid in self._cam_ids]
+        self.page.camera_page.set_cameras(cams, build_rtsp_url)
+
+        # سازگاری: wall به صفحه‌ی مرکزی اشاره می‌کند.
+        self.wall = self.page.camera_page
+
+        # نوار افزونه‌ی نما: دکمه‌ی کنسول کامل.
+        extras = QToolBar("افزونه‌های نما")
+        extras.setMovable(False)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, extras)
+        self.console_btn = QPushButton("🎛 کنسول")
+        self.console_btn.setToolTip(
+            "باز کردن کنسول کامل مدیریت دوربین برای دوربین انتخاب‌شده\n"
+            "(پخش بازبینی + همه‌ی ابزارها) — فقط برای کانال‌های NVR")
+        self.console_btn.clicked.connect(self._open_full_console)
+        extras.addWidget(self.console_btn)
+
+        # دابل‌کلیک روی رویداد = باز کردن کنسول در آن لحظه.
+        try:
+            self.page.events_panel.events_panel_list.itemDoubleClicked.connect(
+                self._on_event_double_clicked)
+        except Exception:
+            pass
+
+        # تازه‌سازی دوره‌ای پنل رویدادها از report_store مشترک.
+        self._events_timer = QTimer(self)
+        self._events_timer.timeout.connect(self._refresh_events_panel)
+        self._events_timer.start(30000)
+        self._refresh_events_panel()
+
         # F11: تمام‌صفحه؛ دابل‌کلیک روی هرجای پنجره هم همین کار را می‌کند.
         self._fs_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
         self._fs_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
         self._fs_shortcut.activated.connect(self.toggle_fullscreen)
         self.installEventFilter(self)
 
+    # ------------------------------------------------- همگام‌سازی شمارش --
+    def _on_wall_people_toggle_all(self, enabled):
+        """تاگل شمارش افراد دیوار نما -> اعمال روی دوربین‌های پنجره‌ی اصلی هم."""
+        if self._on_person_toggle is None:
+            return
+        for cid in self._cam_ids:
+            try:
+                self._on_person_toggle(cid, bool(enabled))
+            except Exception:
+                pass
+
+    def _selected_cam(self):
+        try:
+            slot = self.wall.selected_slot()
+            return slot.cam if slot is not None else None
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------ رویدادها --
+    def _refresh_events_panel(self):
+        try:
+            self.page.events_panel.refresh_from_report_store(limit=100)
+        except Exception:
+            pass
+
+    def _on_event_double_clicked(self, item):
+        """دابل‌کلیک روی رویداد = باز کردن کنسول مدیریت دوربین در آن لحظه."""
+        try:
+            ts = item.data(Qt.ItemDataRole.UserRole)
+            text = item.text()
+        except Exception:
+            return
+        cam = self._find_cam_for_event(text)
+        if cam is None:
+            cam = self._selected_cam()
+        if cam is None:
+            return
+        try:
+            event_dt = datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            event_dt = None
+        self._open_console_for_cam(cam, event_dt)
+
+    def _find_cam_for_event(self, text):
+        try:
+            for cid in self._cam_ids:
+                c = (self.camera_store.get_camera(cid) if self.camera_store else None)
+                if c and c.get("name") and c["name"] in str(text):
+                    return c
+        except Exception:
+            pass
+        return None
+
+
+    def _open_console_for_cam(self, cam, event_dt=None):
+        """باز کردن کنسول NVR برای دوربین؛ event_dt لحظه‌ی رویداد (اختیاری)."""
+        nvr_id = (cam or {}).get("nvr_id")
+        channel = (cam or {}).get("channel")
+        if not nvr_id or channel is None or self.camera_store is None:
+            QMessageBox.information(
+                self, "کنسول",
+                "کنسول کامل فقط برای کانال‌های NVR است؛ این دوربین مستقل است.")
+            return
+        try:
+            nvr = self.camera_store.get_nvr(nvr_id)
+        except Exception:
+            nvr = None
+        if not nvr:
+            return
+        try:
+            from nvr_console_dialog import NVRConsoleDialog
+            if event_dt is None:
+                now = datetime.now()
+                start_dt, end_dt = now - timedelta(seconds=40), now
+            else:
+                start_dt = event_dt - timedelta(seconds=10)
+                end_dt = event_dt + timedelta(seconds=30)
+            dlg = NVRConsoleDialog(
+                nvr, channel, start_dt, end_dt,
+                camera_label=(cam or {}).get("name", ""), parent=self,
+                camera_store=self.camera_store, report_store=self.report_store,
+                on_person_toggle=self._on_person_toggle)
+            dlg.exec()
+        except Exception as e:
+            QMessageBox.warning(self, "خطا", f"باز کردن کنسول ممکن نشد:\n{e}")
+
+    def _open_full_console(self):
+        """دکمه‌ی «کنسول کامل»: باز کردن NVRConsoleDialog برای دوربین
+        انتخاب‌شده در لبه‌ی زنده (۴۰ ثانیه‌ی اخیر) — فقط کانال‌های NVR."""
+        self._open_console_for_cam(self._selected_cam())
+
+    # ------------------------------------------------- پنجره (مثل قبل) --
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.MouseButtonDblClick:
             self.toggle_fullscreen()
@@ -281,18 +312,16 @@ class MonitorWindow(QMainWindow):
         return {"geometry": geo, "fullscreen": bool(self.isFullScreen())}
 
     def closeEvent(self, event):
-        for tile in self.tiles:
-            try:
-                tile.stop()
-            except Exception:
-                pass
+        try:
+            self.wall.camera_grid.stop_all()
+        except Exception:
+            pass
         try:
             if self._on_closed is not None:
                 self._on_closed(self)
         except Exception:
             pass
         super().closeEvent(event)
-
 
 class MonitorRoomDialog(QDialog):
     """دیالوگ تنظیم اتاق مانیتورینگ: مدیریت پنجره‌ها و دوربین‌های هر پنجره."""
@@ -447,9 +476,16 @@ class MonitorRoomDialog(QDialog):
 class MonitorRoomManager:
     """مدیریت پنجره‌های اتاق مانیتورینگ — ساخته و نگه‌داری توسط MainWindow."""
 
-    def __init__(self, camera_store, face_engine):
+    def __init__(self, camera_store, face_engine, report_store=None,
+                 on_person_toggle=None, alarm_player=None, building_fire=None,
+                 on_building_fire_log=None):
         self.camera_store = camera_store
         self.face_engine = face_engine
+        self.report_store = report_store
+        self._on_person_toggle = on_person_toggle
+        self._alarm_player = alarm_player
+        self._building_fire = building_fire
+        self._on_building_fire_log = on_building_fire_log
         self.store = MonitorLayoutStore()
         self.windows = []  # list of {"window": MonitorWindow, "cameras": [...]}
         self._win_counter = 0
@@ -472,6 +508,14 @@ class MonitorRoomManager:
     def _on_window_closed(self, win):
         self.windows = [e for e in self.windows if e["window"] is not win]
 
+    def _open_setup_for_window(self):
+        """کال‌بک دکمه‌ی «🖥 اتاق مانیتورینگ» داخل پنجره‌های نما."""
+        try:
+            parent = self.windows[-1]["window"] if self.windows else None
+            self.open_setup_dialog(parent)
+        except Exception:
+            pass
+
     def open_window(self, cam_ids, geometry=None, fullscreen=False):
         """باز کردن یک پنجره‌ی جدید (movable/resizable) با دوربین‌های داده‌شده."""
         cameras_by_id = {c.get("id"): c for c in self.camera_store.get_cameras()}
@@ -481,7 +525,12 @@ class MonitorRoomManager:
         win = MonitorWindow(
             self._next_title(), cam_ids, cameras_by_id,
             self.camera_store.build_rtsp_url, self.face_engine,
-            on_closed=self._on_window_closed)
+            on_closed=self._on_window_closed,
+            camera_store=self.camera_store, report_store=self.report_store,
+            on_person_toggle=self._on_person_toggle,
+            on_open_monitor_room=self._open_setup_for_window,
+            alarm_player=self._alarm_player, building_fire=self._building_fire,
+            on_building_fire_log=self._on_building_fire_log)
         if geometry is None:
             # آبشاری روی صفحه‌ی اصلی تا پنجره‌ها روی هم نیفتند
             try:
