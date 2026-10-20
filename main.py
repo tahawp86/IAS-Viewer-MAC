@@ -237,6 +237,19 @@ class CameraPreviewDialog(QDialog):
 
 
 
+# نگاشت صفحه → کلید قابلیت لایسنس (اسکیمای v2 — فاز ۲ لایسنس).
+# صفحه‌ای که در این نگاشت نیست (home/reports/map/settings) گیت لایسنسی
+# ندارد؛ صفحه‌ی settings همیشه در دسترس می‌ماند چون بارگذاری فایل
+# لایسنس همان‌جاست. مرجع: docs/LICENSE_SCHEMA.md در ریپوی
+# IAS-LicenseManager (بخش ۳)؛ نگاشت با تأیید LICagent.
+PAGE_FEATURE_MAP = {
+    "fire": "fire",
+    "face": "face_recognition",
+    "plate": "plate",
+    "person": "person_tracking",
+}
+
+
 class MainWindow(QMainWindow):
     # (2.0.72-beta) نتیجه‌ی بررسی آپدیت از ترد پس‌زمینه به ترد UI
     update_check_done = pyqtSignal(object)
@@ -386,6 +399,12 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._apply_license_title()
+        # (فاز ۲ لایسنس) گیت صفحات هم با لایسنس جدید فوراً تازه شود تا
+        # دکمه‌های صفحات فعال/غیرفعال بدون ری‌استارت به‌روز شوند.
+        try:
+            self.apply_user_permissions()
+        except Exception:
+            pass
 
     def _show_startup_notices(self):
         """اعلان‌های شروع: هشدار لایسنس (در صورت نیاز) + تغییرات آپدیت."""
@@ -952,6 +971,10 @@ class MainWindow(QMainWindow):
         # شود، صفحه‌ی بدون دسترسی باز نمی‌شود.
         if not self._has_access(key):
             return
+        # (فاز ۲ لایسنس) دفاع عمقی گیت لایسنس: صفحه‌ای که قابلیتش در
+        # فایل لایسنس فعال نیست، حتی با فراخوانی مستقیم هم باز نمی‌شود.
+        if not self._license_allows_page(key):
+            return
         # (2.0.53-beta) کلید صفحه‌ی فعلی برای دکمه‌ی «راهنما» نگه داشته
         # می‌شود تا PDF روی صفحه‌ی مربوط به همین صفحه باز شود.
         self._current_page_key = key
@@ -989,6 +1012,23 @@ class MainWindow(QMainWindow):
         except Exception:
             return True
 
+    def _license_allows_page(self, page_key):
+        """(فاز ۲ لایسنس) آیا قابلیتِ این صفحه در فایل لایسنس فعال است؟
+
+        صفحه‌های بدون کلید در PAGE_FEATURE_MAP همیشه مجازند. برای بقیه
+        فقط خروجی normalize_features لایسنس ملاک است؛ بدون لایسنس معتبر
+        قابلیت‌های لایسنسی قفل‌اند (deny-by-default).
+        """
+        feature = PAGE_FEATURE_MAP.get(page_key)
+        if not feature:
+            return True
+        try:
+            from license import license_feature_enabled
+            return license_feature_enabled(
+                feature, getattr(self, "license_state", None))
+        except Exception:
+            return False
+
     def _is_admin(self):
         if self.current_user is None:
             return True  # حالت توسعه/تست
@@ -1003,7 +1043,9 @@ class MainWindow(QMainWindow):
         try:
             user = self.current_user
             for key, btn in self.nav_buttons.items():
-                btn.setVisible(self._has_access(key))
+                # نمایش دکمه = دسترسی کاربر AND گیت لایسنس (فاز ۲)
+                btn.setVisible(self._has_access(key)
+                               and self._license_allows_page(key))
             is_admin = self._is_admin()
             try:
                 self.settings_page.set_admin_mode(is_admin)
@@ -1019,7 +1061,8 @@ class MainWindow(QMainWindow):
                 self.lock_btn.setVisible(False)
             allowed = [k for k in ("home", "fire", "face", "reports", "plate",
                                    "person", "map", "settings")
-                       if self._has_access(k)]
+                       if self._has_access(k)
+                       and self._license_allows_page(k)]
             if allowed and getattr(self, "_current_page_key", "home") not in allowed:
                 self.show_page(allowed[0])
             if not is_admin:
