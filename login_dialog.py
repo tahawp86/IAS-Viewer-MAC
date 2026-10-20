@@ -216,7 +216,11 @@ class LoginDialog(QDialog):
                     if st.valid and license_app_user_state(st) == "valid":
                         user = None  # ادامه با مسیر لایسنسی پایین
             except Exception:
-                pass
+                # قاعده‌ی ضد دور زدن fail-closed است (حکم ناظر): اگر چک
+                # لایسنس خطا بدهد، ورود با رمز کارخانه‌ای مجاز نمی‌ماند و
+                # کنترل به مسیر لایسنسی می‌رسد؛ بازیابی همیشه با ادمین
+                # ممکن است، پس قفل‌شدنی در کار نیست.
+                user = None
         if not user:
             # مسیر دوم: حساب کاربر داخل فایل لایسنس (app_user) — فقط وقتی
             # لایسنس معتبر و app_user سالم باشد؛ در غیر این صورت fail-closed.
