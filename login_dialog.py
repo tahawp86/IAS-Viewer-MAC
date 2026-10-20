@@ -13,7 +13,7 @@ run_login() رکورد کاربر موفق یا None برمی‌گرداند.
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QMessageBox, QFormLayout,
+    QMessageBox, QFormLayout, QFileDialog,
 )
 
 import user_manager
@@ -126,6 +126,22 @@ class LoginDialog(QDialog):
         self.err_lbl.setVisible(False)
         lay.addWidget(self.err_lbl)
 
+        # --- بخش لایسنس (فاز ۲): بارگذاری فایل لایسنس از همین صفحه‌ی ورود
+        # هم ممکن است (بخش تنظیمات سر جایش می‌ماند). اگر فایل لایسنس حساب
+        # کاربر (app_user) داشته باشد، ورود با همان حساب هم انجام می‌شود.
+        lic_row = QHBoxLayout()
+        self.license_status_lbl = QLabel("")
+        self.license_status_lbl.setStyleSheet("color: #888; font-size: 12px;")
+        self.license_status_lbl.setWordWrap(True)
+        lic_row.addWidget(self.license_status_lbl, 1)
+        self.license_btn = QPushButton("📂 بارگذاری فایل لایسنس…")
+        self.license_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.license_btn.clicked.connect(self._on_license_upload)
+        lic_row.addWidget(self.license_btn)
+        lay.addLayout(lic_row)
+        self._license_state = None
+        self._refresh_license_status()
+
         row = QHBoxLayout()
         row.addStretch()
         login_btn = QPushButton("🔓 ورود")
@@ -138,10 +154,82 @@ class LoginDialog(QDialog):
         row.addWidget(cancel_btn)
         lay.addLayout(row)
 
+    def _refresh_license_status(self):
+        """تازه‌سازی متن وضعیت لایسنس در دیالوگ ورود."""
+        try:
+            from license import load_license, license_app_user_state
+            st = load_license()
+        except Exception:
+            st = None
+        self._license_state = st
+        try:
+            if st is not None and st.valid:
+                au_state = license_app_user_state(st)
+                if au_state == "valid":
+                    txt = (f"🔑 لایسنس معتبر ({st.customer or 'بدون نام'}) — "
+                           "ورود با حساب داخل فایل لایسنس هم فعال است.")
+                elif au_state == "malformed":
+                    txt = ("⚠️ بخش حساب کاربر در فایل لایسنس معتبر نیست؛ "
+                           "ورود لایسنسی غیرفعال است.")
+                else:
+                    txt = f"🔑 لایسنس معتبر ({st.customer or 'بدون نام'})"
+            else:
+                txt = ("🔑 فایل لایسنس بارگذاری نشده است — برنامه در حالت "
+                       "محدود کار می‌کند؛ برای فعال‌سازی کامل، فایل لایسنس "
+                       "را بارگذاری کنید.")
+            self.license_status_lbl.setText(txt)
+        except Exception:
+            pass
+
+    def _on_license_upload(self):
+        """بارگذاری فایل لایسنس از صفحه‌ی ورود (همان مسیر تنظیمات)."""
+        from license import install_license_file
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "انتخاب فایل لایسنس", "", "License (*.lic)")
+        if not fp:
+            return
+        try:
+            install_license_file(fp)
+        except Exception as e:
+            QMessageBox.warning(self, "خطا", f"لایسنس پذیرفته نشد:\n{e}")
+            return
+        self._refresh_license_status()
+        QMessageBox.information(
+            self, "انجام شد",
+            "لایسنس با موفقیت نصب شد. ✅\n"
+            "حالا می‌توانید با نام‌کاربری و رمز داخل فایل لایسنس وارد شوید.")
+
     def _on_login(self):
         username = self.user_edit.text().strip()
         password = self.pass_edit.text()
         user = self.manager.verify(username, password)
+        if user is not None:
+            # قاعده‌ی امنیتی IVDagent: وقتی لایسنس معتبر حساب کاربر
+            # (app_user) دارد، ورود کاربر محلی پیش‌فرض «User» (با رمز
+            # کارخانه‌ایِ شناخته‌شده) غیرفعال می‌شود تا دور زدن حساب
+            # لایسنسی با آن ممکن نباشد. ادمین محلی مستقل می‌ماند.
+            try:
+                if not user.get("is_admin") and \
+                        username == user_manager.DEFAULT_TEST_USER:
+                    from license import load_license, license_app_user_state
+                    st = load_license()
+                    if st.valid and license_app_user_state(st) == "valid":
+                        user = None  # ادامه با مسیر لایسنسی پایین
+            except Exception:
+                pass
+        if not user:
+            # مسیر دوم: حساب کاربر داخل فایل لایسنس (app_user) — فقط وقتی
+            # لایسنس معتبر و app_user سالم باشد؛ در غیر این صورت fail-closed.
+            # ترتیب مهم است: حساب‌های محلی (از جمله ادمین بدون لایسنس)
+            # همیشه اول و دست‌نخورده می‌مانند.
+            try:
+                from license import (load_license, verify_license_user,
+                                     license_session_user)
+                st = load_license()
+                if st.valid and verify_license_user(username, password, st):
+                    user = license_session_user(st)
+            except Exception:
+                user = None
         if not user:
             self.err_lbl.setText("⚠️ نام‌کاربری یا رمز عبور اشتباه است.")
             self.err_lbl.setVisible(True)

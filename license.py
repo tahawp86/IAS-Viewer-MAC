@@ -58,6 +58,118 @@ RESTRICTED_FEATURES = {
     "zone_alerts": False,
 }
 
+# ----------------------------------------------------------------------------
+# اسکیمای v2 — رجیستری کانونیکال قابلیت‌ها (پلتفرم-agnostic)
+# (هم‌رفتار با license_common.py در ریپوی IAS-LicenseManager — سند مرجع:
+# docs/LICENSE_SCHEMA.md؛ هر تغییری باید در هر دو جا هم‌زمان اعمال شود.)
+# هر قابلیت: {"enabled": bool, "count": int}
+#   - enabled=False یعنی قابلیت کاملاً خاموش (دکمه‌ی صفحه مخفی + دسترسی گیت‌شده)
+#   - enabled=True و count=۰ یعنی فعال بدون محدودیت تعداد
+#   - enabled=True و count=N>۰ یعنی حداکثر N دوربین می‌توانند از آن استفاده کنند
+# «cameras» همیشه enabled است و سقف کلی همه‌ی سهمیه‌هاست.
+# ----------------------------------------------------------------------------
+SCHEMA_VERSION = 2
+
+FEATURE_SCHEMA = [
+    ("cameras", "تعداد کل دوربین‌ها"),
+    ("plate", "دوربین‌های پلاک‌خوان"),
+    ("fire", "دوربین‌های تشخیص حریق"),
+    ("person_tracking", "دوربین‌های ردیابی اشخاص"),
+    ("face_recognition", "دوربین‌های چهره‌خوان"),
+    ("region_alert", "دوربین‌های هشدار محدوده"),
+    ("people_counting", "دوربین‌های شمارش افراد"),
+]
+FEATURE_KEYS = [k for k, _ in FEATURE_SCHEMA]
+FEATURE_TITLES = dict(FEATURE_SCHEMA)
+
+# نگاشت کلیدهای قدیمی (v1) به کلید کانونیکال — فقط برای خواندن/مهاجرت
+LEGACY_ALIASES = {
+    "zone_alerts": "region_alert",   # تیک قدیمی «هشدار ورود به محدوده»
+}
+
+# وضعیت قابلیت‌ها در حالت محدود (بدون لایسنس معتبر) — هم‌معنی با
+# DEMO_QUOTAS / RESTRICTED_FEATURES بالا: تصویر دوربین‌ها آزاد، فقط
+# شمارش افراد فعال، بقیه‌ی قابلیت‌های لایسنسی قفل (deny-by-default).
+RESTRICTED_FEATURE_CONFIG = {
+    "cameras": {"enabled": True, "count": 0},
+    "plate": {"enabled": False, "count": 0},
+    "fire": {"enabled": False, "count": 0},
+    "person_tracking": {"enabled": False, "count": 0},
+    "face_recognition": {"enabled": False, "count": 0},
+    "region_alert": {"enabled": False, "count": 0},
+    "people_counting": {"enabled": True, "count": 0},
+}
+
+
+def _norm_entry(v) -> tuple:
+    """نرمال‌سازی یک ورودی feature_config به (enabled, count)."""
+    if isinstance(v, dict):
+        enabled = bool(v.get("enabled", True))
+        try:
+            count = max(0, int(v.get("count", 0) or 0))
+        except (TypeError, ValueError):
+            count = 0
+        return enabled, count
+    if isinstance(v, (tuple, list)) and len(v) >= 2:
+        try:
+            return bool(v[0]), max(0, int(v[1] or 0))
+        except (TypeError, ValueError):
+            return bool(v[0]), 0
+    if isinstance(v, bool):
+        return v, 0
+    return True, 0
+
+
+def migrate_v1_to_v2(payload: dict) -> dict:
+    """مهاجرت payload قدیمی (v1) به feature_config کانونیکال — برای خواننده‌ها."""
+    quotas = payload.get("quotas") or {}
+    qe = payload.get("quota_enabled") or {}
+    feats = payload.get("features") or {}
+    fc = {}
+    for key in FEATURE_KEYS:
+        try:
+            count = max(0, int(quotas.get(key, 0)))
+        except (TypeError, ValueError):
+            count = 0
+        enabled = bool(qe.get(key, True))
+        if key == "cameras":
+            enabled = True
+        fc[key] = {"enabled": enabled, "count": count}
+    # تیک‌های flat قدیمی (people_counting/face_recognition/zone_alerts):
+    # خاموش بودن هرکدام یعنی قابلیت کانونیکال متناظر خاموش است.
+    for legacy_key, v in feats.items():
+        canon = LEGACY_ALIASES.get(legacy_key, legacy_key)
+        if canon in fc and not v:
+            fc[canon]["enabled"] = False
+    return fc
+
+
+def normalize_features(payload: dict) -> dict:
+    """خروجی یکدست برای خواننده‌ها در هر دو نسخه: {key: {"enabled", "count"}}."""
+    if isinstance(payload, dict) and payload.get("schema_version", 1) >= 2 \
+            and isinstance(payload.get("feature_config"), dict):
+        fc = {}
+        for key in FEATURE_KEYS:
+            enabled, count = _norm_entry(payload["feature_config"].get(key, (True, 0)))
+            if key == "cameras":
+                enabled = True
+            fc[key] = {"enabled": enabled, "count": count}
+        return fc
+    return migrate_v1_to_v2(payload or {})
+
+
+def feature_enabled(fc: dict, key: str) -> bool:
+    """آیا این قابلیت در لایسنس فعال است؟ (برای نمایش/مخفی دکمه‌ی صفحه و گیت دسترسی)"""
+    return bool((fc or {}).get(key, {}).get("enabled", False))
+
+
+def feature_count(fc: dict, key: str) -> int:
+    """سقف تعداد دوربین این قابلیت؛ ۰ یعنی نامحدود."""
+    try:
+        return max(0, int((fc or {}).get(key, {}).get("count", 0)))
+    except (TypeError, ValueError):
+        return 0
+
 
 # ----------------------------------------------------------------------------
 # مسیرها
@@ -189,11 +301,14 @@ def check_payload_validity(payload: dict):
 class LicenseState:
     def __init__(self, valid=False, customer="", issued="", expires="",
                  quotas=None, hwid=None, features=None, quota_enabled=None,
-                 error="", path=""):
+                 feature_config=None, payload=None, error="", path=""):
         self.valid = valid
         self.customer = customer
         self.issued = issued
         self.expires = expires
+        # payload تأییدشده‌ی کامل (برای app_user و بررسی‌های بعدی)؛ فقط وقتی
+        # امضا و اعتبار معتبر بوده پر می‌شود.
+        self.payload = payload
         self.quotas = quotas or dict(DEMO_QUOTAS)
         self.hwid = hwid
         # دیفالت «فعال» برای سازگاری با لایسنس‌های قدیمی بدون فیلد features؛
@@ -204,8 +319,18 @@ class LicenseState:
         # (سازگاری با لایسنس‌های صادرشده قبل از v1.2.0 نرم‌افزار صدور)
         self.quota_enabled = quota_enabled if quota_enabled is not None else \
             {k: True for k in QUOTA_ORDER}
+        # خروجی کانونیکال normalize_features (اسکیمای v2) — مرجع گیت
+        # صفحات و قابلیت‌ها. برای حالت نامعتبر از حالت محدود استفاده می‌شود.
+        self.feature_config = feature_config
         self.error = error
         self.path = path
+
+    def get_feature_config(self):
+        """feature_config مؤثر: لایسنس معتبر ← normalize، وگرنه حالت محدود."""
+        if self.valid and isinstance(self.feature_config, dict) \
+                and len(self.feature_config):
+            return self.feature_config
+        return {k: dict(v) for k, v in RESTRICTED_FEATURE_CONFIG.items()}
 
     @property
     def days_left(self):
@@ -234,25 +359,25 @@ def load_license(path=None) -> LicenseState:
         return LicenseState(error=err, path=p,
                             customer=payload.get("customer", ""),
                             expires=payload.get("expires") or "")
-    quotas = dict(DEMO_QUOTAS)
-    pq = payload.get("quotas") or {}
-    for k in quotas:
-        try:
-            quotas[k] = max(0, int(pq.get(k, 0)))
-        except (TypeError, ValueError):
-            pass
-    # قابلیت‌های روشن/خاموش؛ نبودشان در لایسنس یعنی «فعال» (سازگاری عقب‌رو)
-    features = {k: True for k in FEATURE_ORDER}
-    pf = payload.get("features") or {}
-    for k in features:
-        if k in pf:
-            features[k] = bool(pf[k])
-    # فعال/غیرفعال بودن سهمیه‌های تعدادی؛ نبودشان یعنی «فعال» (عقب‌رو)
-    quota_enabled = {k: True for k in QUOTA_ORDER}
-    pqe = payload.get("quota_enabled") or {}
-    for k in quota_enabled:
-        if k in pqe:
-            quota_enabled[k] = bool(pqe[k])
+    # اسکیمای v2: قابلیت‌ها فقط از normalize_features خوانده می‌شوند —
+    # برای فایل‌های v1 مهاجرت در حافظه انجام می‌شود (قرارداد خواننده،
+    # سند docs/LICENSE_SCHEMA.md در ریپوی IAS-LicenseManager، بخش ۳).
+    fc = normalize_features(payload)
+    quotas = {}
+    quota_enabled = {}
+    for k in FEATURE_KEYS:
+        # count عیناً از normalize می‌آید (۰ = نامحدود). «سقف مؤثر =
+        # کمینه‌ی سقف قابلیت و سقف cameras» در سطح مصرف خودبه‌خود برقرار
+        # است: مصرف هر قابلیت از تعداد کل دوربین‌ها بیشتر نمی‌شود و سقف
+        # کل دوربین‌ها هنگام افزودن دوربین اعمال می‌شود (check_quota).
+        quotas[k] = feature_count(fc, k)
+        quota_enabled[k] = feature_enabled(fc, k)
+    # نگاشت به کلیدهای قدیمی features برای سازگاری با گیت‌های موجود
+    features = {
+        "people_counting": feature_enabled(fc, "people_counting"),
+        "face_recognition": feature_enabled(fc, "face_recognition"),
+        "zone_alerts": feature_enabled(fc, "region_alert"),
+    }
     return LicenseState(
         valid=True,
         customer=payload.get("customer", ""),
@@ -262,6 +387,8 @@ def load_license(path=None) -> LicenseState:
         hwid=payload.get("hwid"),
         features=features,
         quota_enabled=quota_enabled,
+        feature_config=fc,
+        payload=payload,
         path=p,
     )
 
@@ -283,12 +410,219 @@ def effective_features(state=None) -> dict:
     return dict(RESTRICTED_FEATURES)
 
 
+# نگاشت معکوس: کلید کانونیکال ← کلید قدیمی‌ای که effective_features با آن
+# کار می‌کند (region_alert ← zone_alerts)
+_CANONICAL_TO_LEGACY = {v: k for k, v in LEGACY_ALIASES.items()}
+
+
 def is_feature_enabled(name: str, state=None) -> bool:
     """آیا قابلیت on/off داده‌شده فعال است؟"""
+    # کلید کانونیکال اسکیمای v2 هم پذیرفته می‌شود (region_alert = zone_alerts)
+    name = _CANONICAL_TO_LEGACY.get(name, name)
     try:
         return bool(effective_features(state).get(name, False))
     except Exception:
         return False
+
+
+def license_feature_enabled(key: str, state=None) -> bool:
+    """گیت قابلیت بر اساس اسکیمای v2 (قرارداد خواننده‌ی سند اسکیما):
+
+    - لایسنس معتبر: فقط خروجی normalize_features ملاک است
+      (feature_enabled روی feature_config).
+    - بدون لایسنس معتبر: حالت محدود — قابلیت‌های لایسنسی قفل‌اند
+      (deny-by-default)؛ فقط cameras و people_counting باز می‌مانند.
+    کلیدهای ناشناخته همیشه False برمی‌گردانند.
+    """
+    try:
+        st = state or load_license()
+        fc = st.get_feature_config()
+        return feature_enabled(fc, key)
+    except Exception:
+        return False
+
+
+def license_feature_limit(key: str, state=None) -> int:
+    """سقف مؤثر تعداد دوربین یک قابلیت؛ ۰ = نامحدود.
+
+    (حکم IVDagent در بازبینی فاز ۲ — عین همین قاعده در ویندوز هم اعمال
+    می‌شود تا دو پلتفرم یکی بمانند.) «سقف مؤثر» نسبت به سقف کل دوربین‌ها
+    سنجیده می‌شود: وقتی cameras سقف دارد (>۰)، سقف مؤثر هر قابلیت =
+    کمینه‌ی سقف خودش و cameras؛ و count صفر (نامحدود) در این حالت یعنی
+    همان سقف cameras. خود quotas در state دست‌نخورده و وفادار به فایل
+    می‌مانند؛ این تابع تنها نقطه‌ی مصرف سقف مؤثر است."""
+    try:
+        st = state or load_license()
+        if not st.valid:
+            return 0
+        raw = int(st.quotas.get(key, 0))
+        if key == "cameras" or key not in FEATURE_KEYS:
+            return raw
+        cam = int(st.quotas.get("cameras", 0))
+        if cam > 0:
+            return cam if raw == 0 else min(raw, cam)
+        return raw
+    except Exception:
+        return 0
+
+
+# ----------------------------------------------------------------------------
+# حساب کاربر برنامه (app_user) — فیلد اختیاری داخل payload (زیر همان امضا)
+# (هم‌رفتار با license_common.py در ریپوی IAS-LicenseManager — سند مرجع:
+# docs/LICENSE_SCHEMA.md بخش ۳-ب؛ هر تغییری باید در هر دو جا هم‌زمان اعمال شود.)
+# ----------------------------------------------------------------------------
+# ورود کاربر برنامه با نام کاربری/رمز داخل خودِ فایل لایسنس انجام می‌شود.
+# رمز هرگز plaintext ذخیره نمی‌شود: فقط هش PBKDF2-HMAC-SHA256 با salt تصادفی
+# یکتا نگه داشته می‌شود (همان پریمیتیو user_manager برنامه‌ها؛ پارامترها از
+# خود فایل خوانده می‌شوند تا صدورهای آینده بدون تغییر اسکیما قوی‌تر شوند).
+APP_USER_ALGO = "pbkdf2-sha256"
+APP_USER_ITERATIONS = 600_000      # صدورهای جدید — توصیه‌ی فعلی OWASP
+APP_USER_SALT_BYTES = 16
+APP_USER_DKLEN = 32
+APP_USER_MIN_ITERATIONS = 100_000  # کف امنیتی خواننده — کمتر از این = بدفرم
+
+
+def hash_app_user_password(password: str) -> dict:
+    """ساخت بخش رمز app_user از رمز خام — فقط لحظه‌ی صدور؛ رمز خام هیچ‌جا
+    ذخیره یا لاگ نمی‌شود و بعد از این فراخوانی دیگر لازم نیست نگهش داشت."""
+    import hashlib
+    salt = os.urandom(APP_USER_SALT_BYTES)
+    dk = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"),
+                             salt, APP_USER_ITERATIONS, APP_USER_DKLEN)
+    return {
+        "password_algo": APP_USER_ALGO,
+        "password_iterations": APP_USER_ITERATIONS,
+        "password_salt": salt.hex(),
+        "password_hash": dk.hex(),
+    }
+
+
+def build_app_user(username: str, password: str) -> dict:
+    """ساخت app_user کامل برای payload از نام کاربری و رمز خام."""
+    username = (username or "").strip()
+    if not username:
+        raise ValueError("نام کاربری حساب نمی‌تواند خالی باشد.")
+    if not password:
+        raise ValueError("رمز حساب نمی‌تواند خالی باشد.")
+    au = {"username": username}
+    au.update(hash_app_user_password(password))
+    return au
+
+
+def _app_user_valid(au) -> bool:
+    """اعتبارسنجی ساختاری app_user (بدون دانستن رمز)."""
+    if not isinstance(au, dict):
+        return False
+    if not isinstance(au.get("username"), str) or not au["username"].strip():
+        return False
+    if au.get("password_algo") != APP_USER_ALGO:
+        return False
+    it = au.get("password_iterations")
+    if not isinstance(it, int) or it < APP_USER_MIN_ITERATIONS:
+        return False
+    try:
+        salt = bytes.fromhex(au.get("password_salt") or "")
+        dk = bytes.fromhex(au.get("password_hash") or "")
+    except (TypeError, ValueError):
+        return False
+    return len(salt) >= APP_USER_SALT_BYTES and len(dk) >= 16
+
+
+def app_user_state(payload: dict) -> str:
+    """وضعیت app_user در payload: ‏"absent" | "valid" | "malformed".
+
+    - absent: فیلد نیست — لایسنس حسابی تحمیل نمی‌کند (رفتار قبلی ورود).
+    - valid: ساختار درست است و می‌شود باهاش ورود را راستی‌آزمایی کرد.
+    - malformed: فیلد هست ولی بدفرم است — ورود لایسنسی باید fail-closed
+      شود (هرگز به رمز پیش‌فرض یا رفتار «بدون حساب» برنگردد)؛ بقیه‌ی
+      لایسنس (feature_config و...) سر جایش معتبر می‌ماند.
+    """
+    if not isinstance(payload, dict) or payload.get("app_user") is None:
+        return "absent"
+    return "valid" if _app_user_valid(payload["app_user"]) else "malformed"
+
+
+def get_app_user(payload: dict) -> dict | None:
+    """app_user معتبر payload یا None (غایب/بدفرم — تفکیک با app_user_state)."""
+    if app_user_state(payload) != "valid":
+        return None
+    return payload["app_user"]
+
+
+def verify_app_user(payload: dict, username: str, password: str) -> bool:
+    """راستی‌آزمایی نام کاربری/رمز در برابر app_user لایسنس.
+
+    پارامترهای هش (salt/تکرار) از خود فایل خوانده می‌شوند و مقایسه‌ی نهایی
+    constant-time است. برای app_user غایب یا بدفرم همیشه False برمی‌گردد.
+    """
+    import hashlib
+    import hmac
+    au = get_app_user(payload)
+    if au is None:
+        return False
+    if (username or "").strip() != au["username"]:
+        return False
+    salt = bytes.fromhex(au["password_salt"])
+    expected = bytes.fromhex(au["password_hash"])
+    dk = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"),
+                             salt, au["password_iterations"], len(expected))
+    return hmac.compare_digest(dk, expected)
+
+
+# ----------------------------------------------------------------------------
+# پل بین LicenseState و app_user — برای دیالوگ ورود
+# ----------------------------------------------------------------------------
+def license_app_user_state(state=None) -> str:
+    """وضعیت app_user لایسنس بارگذاری‌شده: "absent"|"valid"|"malformed".
+
+    بدون لایسنس معتبر "absent" است (مسیر ورود لایسنسی غیرفعال)."""
+    try:
+        st = state or load_license()
+        if not st.valid:
+            return "absent"
+        return app_user_state(st.payload or {})
+    except Exception:
+        return "absent"
+
+
+def verify_license_user(username: str, password: str, state=None) -> bool:
+    """راستی‌آزمایی ورود با حساب داخل فایل لایسنس (فقط لایسنس معتبر)."""
+    try:
+        st = state or load_license()
+        if not st.valid:
+            return False
+        return verify_app_user(st.payload or {}, username, password)
+    except Exception:
+        return False
+
+
+def license_session_user(state=None):
+    """رکورد نشست (هم‌شکل رکوردهای user_manager) برای کاربر app_user.
+
+    دسترسی صفحه‌ای رکورد «همه» است؛ باز و بسته بودن واقعی صفحه‌ها را
+    گیت لایسنس (PAGE_FEATURE_MAP در main.py) تعیین می‌کند. None یعنی
+    لایسنس معتبر با app_user معتبر نداریم.
+    """
+    try:
+        st = state or load_license()
+        if not st.valid:
+            return None
+        au = get_app_user(st.payload or {})
+        if not au:
+            return None
+        return {
+            "username": au["username"],
+            "salt": "",
+            "pass_hash": "",
+            "is_admin": False,
+            "must_change_password": False,
+            "permissions": {k: True for k in
+                            ("home", "fire", "face", "reports", "plate",
+                             "person", "map", "settings")},
+            "via_license": True,
+        }
+    except Exception:
+        return None
 
 
 def is_quota_enabled(name: str, state=None) -> bool:
